@@ -1,0 +1,15 @@
+backtrader
+yfinance
+numpy
+pandas
+scikit-learn
+scipy
+matplotlib
+python-dotenv
+requests
+html5lib
+lxml
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+openpyxl
