@@ -45,7 +45,7 @@ def build_summary_report(strategy) -> Dict[str, Any]:
     # סכום התיק בסוף הריצה
     meta["equity_end"] = float(broker.getvalue())
     meta["cash_end"] = float(broker.getcash())
-
+    meta["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
     # אם שמרת ערך התחלתי באסטרטגיה (כמו starting_cash / starting_value)
     starting_value = getattr(strategy, "starting_cash", None)
     if starting_value is None:
