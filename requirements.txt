@@ -13,3 +13,6 @@ google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
 openpyxl
+langgraph
+langchain_google_genai
+python-dotenv
