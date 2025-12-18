@@ -16,3 +16,4 @@ openpyxl
 langgraph
 langchain_google_genai
 python-dotenv
+edgartools
