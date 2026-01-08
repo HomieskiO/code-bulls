@@ -8,7 +8,7 @@ import os
 DATA_PATH = '/Users/omerchomsky/mta/code_bulls/Stock Market Dataset/Stocks/*'
 START_DATE = '1995-01-01'
 END_DATE = '2015-12-31'
-OUTPUT_FILE = 'top_3_percent_gainers.parquet'
+OUTPUT_FILE = 'top_3_percent_gainers.csv'
 
 
 def process_stock_file(filepath):
@@ -125,7 +125,7 @@ def main():
     print(f"Filtering complete. Original rows: {len(full_df)}, Top rows: {len(top_gainers)}")
 
     print(f"Saving to {OUTPUT_FILE}...")
-    top_gainers.to_parquet(OUTPUT_FILE, index=False)
+    top_gainers.to_csv(OUTPUT_FILE, index=False)
     print("Done.")
 
 if __name__ == "__main__":
