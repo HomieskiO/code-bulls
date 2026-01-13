@@ -15,7 +15,7 @@ END_DATE = '2015-12-31'
 OUTPUT_FILE = 'top_percent_gainers.csv'
 
 # Default Parameters
-DEFAULT_TOP_PERCENT = 2.0  # Top 2%
+DEFAULT_TOP_PERCENT = 1.0  # Top 2%
 DEFAULT_MIN_DOLLAR_VOL = 5_000_000  # $5 Million
 DEFAULT_MIN_ADR = 3.5  # 3.5% Average Daily Range
 
