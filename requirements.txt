@@ -18,3 +18,4 @@ langchain_google_genai
 python-dotenv
 edgartools
 twitter_scraper_selenium
+snakeviz
