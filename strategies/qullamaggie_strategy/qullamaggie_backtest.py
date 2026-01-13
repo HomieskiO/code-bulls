@@ -1,10 +1,17 @@
 import backtrader as bt
-import glob
 import os
 import datetime
 import pandas as pd
 import time
 
+def fast_date_parse(date_string):
+    # Assumes format 'YYYY-MM-DD'
+    # Slicing strings is much faster than regex/strptime
+    return datetime.datetime(
+        int(date_string[0:4]),
+        int(date_string[5:7]),
+        int(date_string[8:10])
+    )
 
 class SimpleStrategy(bt.Strategy):
     def __init__(self):
@@ -18,6 +25,10 @@ class SimpleStrategy(bt.Strategy):
 
 cerebro = bt.Cerebro()
 cerebro.addstrategy(SimpleStrategy)
+
+# print("--- STARTING PROFILE ---")
+# profiler = cProfile.Profile()
+# profiler.enable()
 
 DATA_DIR = '/Users/omerchomsky/mta/code_bulls/Stock Market Dataset/Stocks/'
 
@@ -38,21 +49,18 @@ for file_name in target_filenames:
         continue
 
     try:
-        df = pd.read_csv(
-            file_path,
-            parse_dates=['Date'],
-            index_col='Date'
-        )
-
-        data = bt.feeds.PandasData(
-            dataname=df,
+        data = bt.feeds.GenericCSVData(
+            dataname=file_path,
             name=file_name,
-            open='Open',
-            high='High',
-            low='Low',
-            close='Close',
-            volume='Volume',
-            openinterest='OpenInt'
+            dtformat=fast_date_parse,
+            date=0,
+            open=1,
+            high=2,
+            low=3,
+            close=4,
+            volume=5,
+            openinterest=6,
+            preload=True
         )
         cerebro.adddata(data)
 
@@ -63,10 +71,7 @@ cerebro.broker.setcash(100000.0)
 
 print('Starting Portfolio Value: %.2f' % cerebro.broker.getvalue())
 start_time = time.time()
-cerebro.run(stdstats=False,       # Disables standard observers (Broker, Trades, BuySell)
-    tradehistory=False,   # Disables keeping a log of every trade
-    exactbars=True        # Saves memory by keeping only the newest data bar
-)
+cerebro.run(stdstats=False, tradehistory=False)
 end_time = time.time()
 print('Final Portfolio Value: %.2f' % cerebro.broker.getvalue())
 
