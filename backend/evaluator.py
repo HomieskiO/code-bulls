@@ -47,19 +47,19 @@ class Expectancy(bt.Analyzer):
         wins   = [t for t in trades if t > 0]
         losses = [t for t in trades if t <= 0]
 
-        win_rate  = len(wins)   / total
-        loss_rate = len(losses) / total
-        avg_win   = float(np.mean(wins))                       if wins   else 0.0
-        avg_loss  = float(np.mean([abs(l) for l in losses]))   if losses else 0.0
+        win_rate  = len(wins)   / total if total > 0 else 0.0
+        loss_rate = len(losses) / total if total > 0 else 0.0
+        avg_win   = float(np.mean(wins)) if wins else 0.0
+        avg_loss  = float(np.mean([abs(l) for l in losses])) if losses else 0.0
         expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
 
         return {
             "total_trades": total,
-            "win_rate":     round(win_rate, 4),
-            "loss_rate":    round(loss_rate, 4),
-            "avg_win":      round(avg_win,   2),
-            "avg_loss":     round(avg_loss,  2),
-            "expectancy":   round(expectancy, 2),
+            "win_rate":     win_rate,
+            "loss_rate":    loss_rate,
+            "avg_win":      avg_win,
+            "avg_loss":     avg_loss,
+            "expectancy":   expectancy,
         }
 
 
@@ -94,7 +94,7 @@ class CAGRAnalyzer(bt.Analyzer):
             return {"cagr": 0.0}
 
         cagr = (self._end_value / self._start_value) ** (1.0 / years) - 1.0
-        return {"cagr": round(cagr, 4)}
+        return {"cagr": cagr}
 
 
 # ---------------------------------------------------------------------------
@@ -111,18 +111,22 @@ def get_metrics(cerebro, results):
         cerebro.addanalyzer(bt.analyzers.TimeReturn, _name='cagr', ...)
 
     Returns a flat dict with keys matching what graph.py / the frontend expect.
+    All percentage-based metrics are returned as ratios (e.g., 0.5 for 50%).
     """
     strat         = results[0]
     initial_cash  = cerebro.broker.startingcash
     final_value   = cerebro.broker.getvalue()
-    total_return  = round((final_value / initial_cash - 1), 4)
+    total_return  = (final_value / initial_cash - 1) if initial_cash > 0 else 0.0
 
     # --- Expectancy analyzer ---
     exp_data = strat.analyzers.expectancy.get_analysis()
+    expectancy_value = exp_data.get("expectancy", 0.0)
+    expectancy_ratio = (expectancy_value / initial_cash) if initial_cash > 0 else 0.0
 
     # --- DrawDown ---
     dd_data  = strat.analyzers.drawdown.get_analysis()
-    max_dd   = dd_data.get("max", {}).get("drawdown", 0.0)
+    max_dd_pct   = dd_data.get("max", {}).get("drawdown", 0.0)  # This is in %, e.g. 23.8 for 23.8%
+    max_dd_ratio = max_dd_pct / 100.0
 
     # --- CAGR  (support both CAGRAnalyzer and bt.analyzers.TimeReturn) ---
     cagr = 0.0
@@ -130,20 +134,20 @@ def get_metrics(cerebro, results):
         raw = strat.analyzers.cagr.get_analysis()
         if isinstance(raw, dict):
             if "cagr" in raw:                           # CAGRAnalyzer
-                cagr = raw["cagr"]
+                cagr = raw["cagr"]                      # Already a ratio
             else:                                       # TimeReturn → {date: float}
                 annual_returns = list(raw.values())
                 if annual_returns:
-                    cagr = round(float(np.mean(annual_returns)), 4)
+                    cagr = float(np.mean(annual_returns)) # Already a ratio
 
     return {
-        "cagr":                  cagr,
-        "max_drawdown":          round(max_dd, 4),
-        "win_rate":              exp_data.get("win_rate",   0.0),
-        "avg_win":               exp_data.get("avg_win",    0.0),
-        "avg_loss":              exp_data.get("avg_loss",   0.0),
-        "expectancy":            exp_data.get("expectancy", 0.0),
+        "cagr":                  round(cagr, 4),
+        "max_drawdown":          round(max_dd_ratio, 4),
+        "win_rate":              round(exp_data.get("win_rate", 0.0), 4),
+        "avg_win":               round(exp_data.get("avg_win", 0.0), 2),
+        "avg_loss":              round(exp_data.get("avg_loss", 0.0), 2),
+        "expectancy":            round(expectancy_ratio, 4),
         "total_trades":          exp_data.get("total_trades", 0),
         "final_portfolio_value": round(final_value, 2),
-        "total_return_pct":      total_return,
+        "total_return":          round(total_return, 4),
     }

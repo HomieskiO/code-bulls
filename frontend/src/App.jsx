@@ -28,9 +28,9 @@ const IterationTable = ({ iterations }) => (
                         <td className="px-6 py-4 whitespace-nowrap font-medium">{iter.iteration}</td>
                         <td className="px-6 py-4 whitespace-nowrap font-mono text-sm">{JSON.stringify(iter.config)}</td>
                         <td className="px-6 py-4 whitespace-nowrap">{(iter.metrics.cagr * 100).toFixed(2)}%</td>
-                        <td className="px-6 py-4 whitespace-nowrap">{iter.metrics.max_drawdown.toFixed(2)}</td>
+                        <td className="px-6 py-4 whitespace-nowrap">{(iter.metrics.max_drawdown * 100).toFixed(2)}%</td>
                         <td className="px-6 py-4 whitespace-nowrap">{(iter.metrics.win_rate * 100).toFixed(2)}%</td>
-                        <td className="px-6 py-4 whitespace-nowrap font-semibold">{iter.metrics.expectancy.toFixed(2)}</td>
+                        <td className="px-6 py-4 whitespace-nowrap font-semibold">{(iter.metrics.expectancy * 100).toFixed(2)}%</td>
                     </tr>
                 ))}
             </tbody>
@@ -109,9 +109,9 @@ function App() {
                         </div>
                         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
                             <MetricCard title="CAGR" value={results.best_configuration.metrics.cagr} formatAsPercent />
-                            <MetricCard title="Max Drawdown" value={results.best_configuration.metrics.max_drawdown} />
+                            <MetricCard title="Max Drawdown" value={results.best_configuration.metrics.max_drawdown} formatAsPercent />
                             <MetricCard title="Win Rate" value={results.best_configuration.metrics.win_rate} formatAsPercent />
-                            <MetricCard title="Expectancy" value={results.best_configuration.metrics.expectancy} />
+                            <MetricCard title="Expectancy" value={results.best_configuration.metrics.expectancy} formatAsPercent />
                             <MetricCard title="Avg. Win" value={results.best_configuration.metrics.avg_win} />
                             <MetricCard title="Avg. Loss" value={results.best_configuration.metrics.avg_loss} />
                         </div>
