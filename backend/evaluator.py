@@ -12,6 +12,31 @@ import backtrader.analyzers as btanalyzers
 
 
 # ---------------------------------------------------------------------------
+# Analyzer: PortfolioValue  (monthly samples for equity-curve chart)
+# ---------------------------------------------------------------------------
+
+class PortfolioValueAnalyzer(bt.Analyzer):
+    """Records monthly portfolio value for equity-curve visualisation."""
+
+    def start(self):
+        self._values     = []
+        self._last_month = None
+
+    def next(self):
+        d = self.strategy.datetime.date()
+        m = (d.year, d.month)
+        if m != self._last_month:
+            self._values.append({
+                "date":  d.isoformat(),
+                "value": round(self.strategy.broker.getvalue(), 2),
+            })
+            self._last_month = m
+
+    def get_analysis(self):
+        return self._values
+
+
+# ---------------------------------------------------------------------------
 # Analyzer: Expectancy
 # ---------------------------------------------------------------------------
 
@@ -136,6 +161,10 @@ def get_metrics(cerebro, results):
                 if annual_returns:
                     cagr = round(float(np.mean(annual_returns)) * 100, 4)
 
+    portfolio_values = []
+    if hasattr(strat.analyzers, "portfolio"):
+        portfolio_values = strat.analyzers.portfolio.get_analysis()
+
     return {
         "cagr":                  cagr,
         "max_drawdown":          round(max_dd, 4),
@@ -146,4 +175,5 @@ def get_metrics(cerebro, results):
         "total_trades":          exp_data.get("total_trades", 0),
         "final_portfolio_value": round(final_value, 2),
         "total_return_pct":      total_return,
+        "portfolio_values":      portfolio_values,
     }

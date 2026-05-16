@@ -16,7 +16,7 @@ from typing import TypedDict, List
 import json
 import backtrader as bt
 import yfinance as yf
-from evaluator import Expectancy, get_metrics, CAGRAnalyzer
+from evaluator import Expectancy, get_metrics, CAGRAnalyzer, PortfolioValueAnalyzer
 import os
 import re
 import numpy as np
@@ -43,7 +43,7 @@ else:
 import google.genai as genai
 
 _client = None
-_model_name = "gemini-2.5-flash"
+_model_name = "gemini-2.5-flash-lite"
 
 try:
     print("Attempting to configure Gemini...")
@@ -79,6 +79,22 @@ def _call_gemini(prompt: str) -> str:
         contents=prompt,
     )
     return response.text
+
+
+# ---------------------------------------------------------------------------
+# Best-config scoring
+# ---------------------------------------------------------------------------
+
+def _config_score(metrics: dict) -> float:
+    """
+    Combined quality score used to pick the best iteration.
+    Weights: 65% CAGR (return), 35% drawdown penalty.
+    Both values are in % form (e.g. cagr=15 means 15%).
+    Higher score = better risk-adjusted return.
+    """
+    cagr = float(metrics.get("cagr",         0) or 0)
+    dd   = abs(float(metrics.get("max_drawdown", 0) or 0))
+    return cagr * 0.65 - dd * 0.35
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +182,30 @@ def _make_exec_namespace() -> dict:
     }
 
 
+# Common indicator names that LLMs consistently get wrong
+_CODE_FIXES = {
+    "bt.indicators.Crossover":   "bt.indicators.CrossOver",
+    "bt.ind.Crossover":          "bt.indicators.CrossOver",
+    "indicators.Crossover":      "indicators.CrossOver",
+    "bt.indicators.Stochastic(": "bt.indicators.Stochastic(",   # already correct, keep
+    "bt.indicators.RSI(":        "bt.indicators.RSI(",           # already correct, keep
+    # capitalisation variants
+    "bt.indicators.crossover":   "bt.indicators.CrossOver",
+    "bt.indicators.ema(":        "bt.indicators.EMA(",
+    "bt.indicators.sma(":        "bt.indicators.SMA(",
+    "bt.indicators.rsi(":        "bt.indicators.RSI(",
+    "bt.indicators.macd(":       "bt.indicators.MACD(",
+    "bt.indicators.bollinger":   "bt.indicators.BollingerBands",
+    "bt.indicators.Bollinger(":  "bt.indicators.BollingerBands(",
+}
+
+def _sanitize_code(code: str) -> str:
+    """Fix predictable naming mistakes in LLM-generated backtrader code."""
+    for wrong, right in _CODE_FIXES.items():
+        code = code.replace(wrong, right)
+    return code
+
+
 # ---------------------------------------------------------------------------
 # Node 1: generate_strategy_code
 # ---------------------------------------------------------------------------
@@ -249,8 +289,9 @@ def run_backtest(state: GraphState) -> GraphState:
 
         # FIX 4: exec with pre-populated namespace so `bt`, `np`, etc. resolve
         namespace = _make_exec_namespace()
+        sanitized = _sanitize_code(state["generated_code"])
         try:
-            exec(state["generated_code"], namespace)
+            exec(sanitized, namespace)
         except SyntaxError as se:
             raise ValueError(f"Syntax error in generated strategy code: {se}")
 
@@ -286,6 +327,7 @@ def run_backtest(state: GraphState) -> GraphState:
             _name="cagr",
             timeframe=bt.TimeFrame.Years,
         )
+        cerebro.addanalyzer(PortfolioValueAnalyzer,  _name="portfolio")
 
         print(f"  Running cerebro with config: {config}")
         results = cerebro.run()
@@ -297,10 +339,7 @@ def run_backtest(state: GraphState) -> GraphState:
         ]
 
         best = state.get("best_config_so_far", {})
-        if (
-            not best
-            or metrics.get("expectancy", 0) > best.get("metrics", {}).get("expectancy", 0)
-        ):
+        if not best or _config_score(metrics) > _config_score(best.get("metrics", {})):
             best = {"config": config, "metrics": metrics}
 
         return {
@@ -333,11 +372,13 @@ Iteration {prev_iter} results:
   Configuration: {prev_config}
   Metrics: {prev_metrics}
 
-Analyse the results and propose a new configuration that improves Expectancy
-and lowers Max Drawdown.
+Analyse the results and propose new VALUES that improve CAGR while keeping Max Drawdown low.
 
-Output ONLY a single ```json block containing the updated parameter values.
-No explanation, no other text.
+CRITICAL RULES:
+- You MUST use EXACTLY these parameter names (no others): {valid_keys}
+- Do NOT rename, add, or remove any keys.
+- Output ONLY a single ```json block with the updated values.
+- No explanation, no other text.
 """
 
 def optimize_strategy(state: GraphState) -> GraphState:
@@ -346,13 +387,16 @@ def optimize_strategy(state: GraphState) -> GraphState:
     if _client is None:
         return {**state, "error": "Gemini client not initialised."}
 
-    prev = state["all_iteration_results"][-1]
+    prev        = state["all_iteration_results"][-1]
+    valid_keys  = list(prev["config"].keys())
+
     prompt = _OPTIMIZE_PROMPT.format(
         prompt=state["strategy_prompt"],
         code=state["generated_code"],
         prev_iter=prev["iteration"],
         prev_config=json.dumps(prev["config"],  indent=2),
         prev_metrics=json.dumps(prev["metrics"], indent=2),
+        valid_keys=json.dumps(valid_keys),
     )
 
     try:
@@ -363,12 +407,16 @@ def optimize_strategy(state: GraphState) -> GraphState:
                 "Optimisation response missing ```json block.\n"
                 f"Response: {response_text[:400]}"
             )
-        new_config = json.loads(json_match.group(1).strip())
+        raw_config = json.loads(json_match.group(1).strip())
+
+        # Guard: keep only keys that exist in the original config;
+        # fall back to the previous value for any key the LLM dropped.
+        new_config = {k: raw_config.get(k, prev["config"][k]) for k in valid_keys}
+        print(f"  Optimised config (sanitised): {new_config}")
 
         return {
             **state,
             "current_config":           new_config,
-            # FIX 5: increment AFTER the current run, so iter 1→2→3 each run
             "current_iteration_number": iteration + 1,
         }
     except Exception as e:
