@@ -55,8 +55,8 @@ class Expectancy(bt.Analyzer):
 
         return {
             "total_trades": total,
-            "win_rate":     round(win_rate  * 100, 4),   # % form
-            "loss_rate":    round(loss_rate * 100, 4),   # % form
+            "win_rate":     round(win_rate, 4),
+            "loss_rate":    round(loss_rate, 4),
             "avg_win":      round(avg_win,   2),
             "avg_loss":     round(avg_loss,  2),
             "expectancy":   round(expectancy, 2),
@@ -94,7 +94,7 @@ class CAGRAnalyzer(bt.Analyzer):
             return {"cagr": 0.0}
 
         cagr = (self._end_value / self._start_value) ** (1.0 / years) - 1.0
-        return {"cagr": round(cagr * 100, 4)}   # % form
+        return {"cagr": round(cagr, 4)}
 
 
 # ---------------------------------------------------------------------------
@@ -115,14 +115,14 @@ def get_metrics(cerebro, results):
     strat         = results[0]
     initial_cash  = cerebro.broker.startingcash
     final_value   = cerebro.broker.getvalue()
-    total_return  = round((final_value / initial_cash - 1) * 100, 4)
+    total_return  = round((final_value / initial_cash - 1), 4)
 
     # --- Expectancy analyzer ---
     exp_data = strat.analyzers.expectancy.get_analysis()
 
     # --- DrawDown ---
     dd_data  = strat.analyzers.drawdown.get_analysis()
-    max_dd   = dd_data.get("max", {}).get("drawdown", 0.0)   # already in %
+    max_dd   = dd_data.get("max", {}).get("drawdown", 0.0)
 
     # --- CAGR  (support both CAGRAnalyzer and bt.analyzers.TimeReturn) ---
     cagr = 0.0
@@ -134,7 +134,7 @@ def get_metrics(cerebro, results):
             else:                                       # TimeReturn → {date: float}
                 annual_returns = list(raw.values())
                 if annual_returns:
-                    cagr = round(float(np.mean(annual_returns)) * 100, 4)
+                    cagr = round(float(np.mean(annual_returns)), 4)
 
     return {
         "cagr":                  cagr,

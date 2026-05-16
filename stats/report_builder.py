@@ -252,7 +252,7 @@ def _build_trades_summary(trades_analysis: Any) -> Dict[str, Any]:
             stats["losses"] = lost.get("total", 0)
 
             # Win Rate
-            stats["win_rate_pct"] = (stats["wins"] / total_closed * 100) if total_closed > 0 else 0.0
+            stats["win_rate"] = (stats["wins"] / total_closed) if total_closed > 0 else 0.0
 
             # PnL Stats
             pnl_data = trades_analysis.get("pnl", {})

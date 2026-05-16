@@ -43,7 +43,7 @@ else:
 import google.genai as genai
 
 _client = None
-_model_name = "gemini-2.5-flash"
+_model_name = "gemini-2.5-flash-lite"
 
 try:
     print("Attempting to configure Gemini...")
