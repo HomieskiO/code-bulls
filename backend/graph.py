@@ -22,7 +22,7 @@ from datetime import datetime
 
 from llm_client import call_gemini
 from data_loader import load_ticker_data
-from scanner import compute_daily_selections
+from scanner import compute_daily_selections, compute_full_kaggle_selections
 from evaluator import Expectancy, get_metrics, CAGRAnalyzer, PortfolioValueAnalyzer
 
 # Keep backward-compat alias for main.py
@@ -65,6 +65,7 @@ class GraphState(TypedDict):
     daily_selections:  dict     # {"2020-01-03": ["AAPL", "MSFT"], ...}
     scan_rule:         str
     scan_top_n:        int
+    universe_type:     str      # "preset" | "full_kaggle_stocks" | "full_kaggle_all"
 
     # Risk profile (drives default param values in generated code)
     risk_profile: dict          # {level, stop_loss_pct, take_profit_pct, ...}
@@ -152,13 +153,20 @@ Crucial requirements:
 1. Configure ALL numeric values via `params` — never hardcode them.
 2. No imports in the class body — `bt`, `np`, and `daily_selections` are available as globals.
 3. ALWAYS include these three risk parameters in `params` (use suggested defaults below):
-   - stop_loss_pct   : float  (e.g. 0.05 = 5%; 0.0 = disabled)
-   - take_profit_pct : float  (e.g. 0.10 = 10%; 0.0 = disabled)
+   - stop_loss_pct     : float  (e.g. 0.05 = 5%;  0.0 = disabled)
+   - take_profit_pct   : float  (e.g. 0.10 = 10%; 0.0 = disabled)
    - position_size_pct : float  (e.g. 0.95 = allocate 95% of cash per trade)
-4. Track entry price after a buy: `self.entry_price = self.data.close[0]`
-5. Check stop-loss and take-profit on every bar if position is open.
+4. In `__init__`, always initialise `self.entry_price = 0.0` (never None).
+   In `notify_order`, when a buy fills set `self.entry_price = order.executed.price`:
+       def notify_order(self, order):
+           if order.status == order.Completed and order.isbuy():
+               self.entry_price = order.executed.price
+           elif order.status == order.Completed and order.issell():
+               self.entry_price = 0.0
+5. Check stop-loss / take-profit on every bar only when `self.position.size > 0 and self.entry_price > 0`.
+6. DO NOT add any print(), self.log(), or logging calls anywhere in the class.
 {multi_stock_block}
-6. Output EXACTLY one ```python block (the strategy class) and one ```json block (default param values).
+7. Output EXACTLY one ```python block (the strategy class) and one ```json block (default param values).
 
 Risk profile: {risk_level}
 Suggested defaults:
@@ -212,7 +220,6 @@ EXPLANATION: Tightened fast_period to capture shorter signals; reduced stop_loss
 # ---------------------------------------------------------------------------
 
 def generate_strategy_code(state: GraphState) -> GraphState:
-    print("--- Node: generate_strategy_code ---")
 
     rp            = state.get("risk_profile") or {}
     risk_level    = rp.get("level",              "moderate")
@@ -251,7 +258,6 @@ def generate_strategy_code(state: GraphState) -> GraphState:
             "error":                    None,
         }
     except Exception as e:
-        print(f"ERROR in generate_strategy_code: {e}")
         return {**state, "error": str(e)}
 
 
@@ -261,25 +267,47 @@ def generate_strategy_code(state: GraphState) -> GraphState:
 
 def run_backtest(state: GraphState) -> GraphState:
     iteration = state["current_iteration_number"]
-    print(f"--- Node: run_backtest (iter {iteration}) ---")
+    print(f"[backtest] iter {iteration}")
 
     try:
-        data_source     = state.get("data_source",      "yfinance")
-        tickers         = state.get("tickers",          [])
-        is_multi        = state.get("is_multi_stock",   False)
-        daily_sel       = state.get("daily_selections", {})
-        rp              = state.get("risk_profile",     {})
-        position_pct    = rp.get("position_size_pct",   0.95)
-        scan_top_n      = state.get("scan_top_n",       1)
-        end_date        = datetime.now().strftime("%Y-%m-%d")
+        data_source    = state.get("data_source",      "yfinance")
+        tickers        = list(state.get("tickers",     []))
+        is_multi       = state.get("is_multi_stock",   False)
+        daily_sel      = state.get("daily_selections", {})
+        rp             = state.get("risk_profile",     {})
+        position_pct   = rp.get("position_size_pct",   0.95)
+        scan_top_n     = state.get("scan_top_n",       1)
+        universe_type  = state.get("universe_type",    "preset")
+        end_date       = datetime.now().strftime("%Y-%m-%d")
 
-        # Resolve tickers
-        if not tickers:
-            tickers = [get_ticker_from_prompt(state["strategy_prompt"])]
+        is_full_kaggle = universe_type.startswith("full_kaggle")
 
-        # --- Pre-compute daily selections for multi-stock ---
-        if is_multi and len(tickers) > 1 and not daily_sel:
-            print(f"  [scanner] Computing daily selections for {tickers} …")
+        # ── Full-Kaggle dynamic scan (two-pass) ──────────────────────────
+        if is_full_kaggle:
+            if not daily_sel:
+                subdirs = ("Stocks", "ETFs") if universe_type == "full_kaggle_all" else ("Stocks",)
+                print(f"[scanner] full-Kaggle scan  rule={state.get('scan_rule','top_gainers')} ...")
+                daily_sel = compute_full_kaggle_selections(
+                    start=BACKTEST_START,
+                    end=end_date,
+                    rule=state.get("scan_rule", "top_gainers"),
+                    top_n=scan_top_n,
+                    subdirs=subdirs,
+                )
+                state = {**state, "daily_selections": daily_sel}
+
+            # Collect the unique tickers that were ever selected
+            unique = sorted({t for sel in daily_sel.values() for t in sel})
+            if not unique:
+                raise ValueError(
+                    "Full-Kaggle scan produced no selections. "
+                    "Try a different rule or a wider date range."
+                )
+            tickers = unique
+            print(f"[scanner] {len(tickers)} unique tickers selected")
+
+        # ── Preset multi-stock scan ───────────────────────────────────────
+        elif is_multi and len(tickers) > 1 and not daily_sel:
             daily_sel = compute_daily_selections(
                 tickers=tickers,
                 start=BACKTEST_START,
@@ -288,13 +316,15 @@ def run_backtest(state: GraphState) -> GraphState:
                 rule=state.get("scan_rule", "top_volume"),
                 top_n=scan_top_n,
             )
-            # Persist back to state so future iterations reuse it
             state = {**state, "daily_selections": daily_sel}
+
+        # ── Single-stock fallback ─────────────────────────────────────────
+        elif not tickers:
+            tickers = [get_ticker_from_prompt(state["strategy_prompt"])]
 
         # --- Load data feeds ---
         data_feeds = []
         for ticker in tickers:
-            print(f"  Loading {ticker} via {data_source} …")
             df = load_ticker_data(ticker, BACKTEST_START, end_date, data_source)
             df.index = pd.to_datetime(df.index)
             feed = bt.feeds.PandasData(
@@ -338,10 +368,10 @@ def run_backtest(state: GraphState) -> GraphState:
         cerebro.addanalyzer(bt.analyzers.TimeReturn, _name="cagr", timeframe=bt.TimeFrame.Years)
         cerebro.addanalyzer(PortfolioValueAnalyzer,  _name="portfolio")
 
-        print(f"  Config: {config}")
+        print(f"[backtest] iter {iteration} config: {config}")
         results = cerebro.run()
         metrics = get_metrics(cerebro, results)
-        print(f"  Metrics: {metrics}")
+        print(f"[backtest] iter {iteration} → CAGR={metrics.get('cagr')}%  DD={metrics.get('max_drawdown')}%")
 
         all_results = state.get("all_iteration_results", []) + [
             {"iteration": iteration, "config": config, "metrics": metrics}
@@ -361,7 +391,7 @@ def run_backtest(state: GraphState) -> GraphState:
         }
 
     except Exception as e:
-        print(f"ERROR in run_backtest: {e}")
+        print(f"[backtest] ERROR: {e}")
         return {**state, "error": str(e)}
 
 
@@ -371,7 +401,6 @@ def run_backtest(state: GraphState) -> GraphState:
 
 def optimize_strategy(state: GraphState) -> GraphState:
     iteration = state["current_iteration_number"]
-    print(f"--- Node: optimize_strategy (was iter {iteration}) ---")
 
     prev       = state["all_iteration_results"][-1]
     valid_keys = list(prev["config"].keys())
@@ -403,8 +432,7 @@ def optimize_strategy(state: GraphState) -> GraphState:
         exp_m       = re.search(r"EXPLANATION:\s*(.+)", raw)
         explanation = exp_m.group(1).strip() if exp_m else f"Iteration {iteration+1}: parameters adjusted."
 
-        print(f"  New config: {new_config}")
-        print(f"  Explanation: {explanation}")
+        print(f"[optimize] iter {iteration+1}: {explanation}")
 
         return {
             **state,
@@ -413,7 +441,7 @@ def optimize_strategy(state: GraphState) -> GraphState:
             "optimization_explanations": state.get("optimization_explanations", []) + [explanation],
         }
     except Exception as e:
-        print(f"ERROR in optimize_strategy: {e}")
+        print(f"[optimize] ERROR: {e}")
         return {**state, "error": str(e)}
 
 

@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
 import json
+import re
 from datetime import datetime
 import pandas as pd
 import yfinance as yf
@@ -62,6 +63,7 @@ class BacktestRequest(BaseModel):
     is_multi_stock:     bool           = False
     scan_rule:          str            = "top_volume"
     scan_top_n:         int            = 1
+    universe_type:      str            = "preset"   # "preset" | "full_kaggle_stocks" | "full_kaggle_all"
     risk_profile:       Dict[str, Any] = Field(default_factory=dict)
     optimization_scope: List[str]      = Field(default_factory=lambda: ["all"])
 
@@ -69,6 +71,11 @@ class BacktestRequest(BaseModel):
 class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     message:    str
+
+
+class AnalyzeRequest(BaseModel):
+    strategy:        str
+    question_answer: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +116,54 @@ def chat_endpoint(request: ChatRequest):
 
 
 # ---------------------------------------------------------------------------
+# POST /api/analyze — one-shot strategy interpretation
+# ---------------------------------------------------------------------------
+
+_ANALYZE_PROMPT = """
+You are analyzing a trading strategy description for a stock backtester.
+Return ONLY a valid JSON object with these exact fields:
+- "message": string — 1-sentence plain-text confirmation of what you understood
+- "question": string or null — ONE follow-up question if something important is unclear, otherwise null
+- "mode": "single" or "multi" or null
+- "ticker": uppercase stock symbol string or null — only if a specific stock is named
+- "universe_preset": one of ["nasdaq100","sp500","faang","mega8"] or null
+- "scan_rule": one of ["top_volume","top_gainers","top_momentum","lowest_rsi"] or null
+- "scan_top_n": integer 1-10 or null
+
+Strategy: "{strategy}"
+{context}
+
+Examples:
+- "trade AAPL EMA crossover" → mode=single, ticker=AAPL
+- "trade the highest volume NASDAQ stock" → mode=multi, universe_preset=nasdaq100, scan_rule=top_volume
+- "best performing S&P 500 stock each month" → mode=multi, universe_preset=sp500, scan_rule=top_gainers
+- "top 3 momentum stocks" → mode=multi, scan_rule=top_momentum, scan_top_n=3
+"""
+
+
+@app.post("/api/analyze")
+def analyze_strategy(request: AnalyzeRequest):
+    ctx = f'User clarification: "{request.question_answer}"' if request.question_answer else ''
+    try:
+        raw  = _call_gemini(_ANALYZE_PROMPT.format(strategy=request.strategy, context=ctx))
+        m    = re.search(r'\{.*\}', raw, re.DOTALL)
+        if m:
+            data = json.loads(m.group(0))
+            return {
+                "message":         data.get("message", "Strategy noted."),
+                "question":        data.get("question"),
+                "mode":            data.get("mode"),
+                "ticker":          data.get("ticker"),
+                "universe_preset": data.get("universe_preset"),
+                "scan_rule":       data.get("scan_rule"),
+                "scan_top_n":      data.get("scan_top_n"),
+            }
+    except Exception as e:
+        print(f"analyze_strategy error: {e}")
+    return {"message": "Got it — adjust the settings and click Run.", "question": None}
+
+
+# ---------------------------------------------------------------------------
 # POST /api/backtest — run optimization loop
 # ---------------------------------------------------------------------------
 
@@ -121,6 +176,7 @@ def run_backtest_endpoint(request: BacktestRequest, db: Session = Depends(get_db
         "is_multi_stock":     request.is_multi_stock,
         "scan_rule":          request.scan_rule,
         "scan_top_n":         request.scan_top_n,
+        "universe_type":      request.universe_type,
         "daily_selections":   {},
         "risk_profile":       request.risk_profile or {},
         "optimization_scope": request.optimization_scope or ["all"],
