@@ -6,12 +6,10 @@ from datetime import datetime
 import pandas as pd
 import yfinance as yf
 
-from graph import app as langgraph_app, _call_gemini
+from graph import app as langgraph_app, multi_app, _call_gemini
 from database import SessionLocal, Strategy, BacktestIteration
 
 app = FastAPI()
-
-BACKTEST_START = "2015-01-01"
 
 
 def get_db():
@@ -45,6 +43,15 @@ def _fetch_benchmark(ticker: str, start: str, end: str, initial_value: float = 1
 
 class BacktestRequest(BaseModel):
     prompt:           str
+    start_date:       str = ""          # "" = use earliest available (no 2015 limit)
+    benchmark_ticker: str = "SPY"
+
+
+class ScreenedBacktestRequest(BaseModel):
+    strategy_prompt:  str
+    screening_prompt: str               # natural language screening description
+    start_date:       str = ""
+    end_date:         str = ""
     benchmark_ticker: str = "SPY"
 
 
@@ -75,17 +82,23 @@ Use plain language. No markdown headers or bullet points — just flowing prose.
 
 @app.post("/api/backtest")
 def run_backtest_endpoint(request: BacktestRequest, db: Session = Depends(get_db)):
-    inputs = {"strategy_prompt": request.prompt}
+    start_date = request.start_date or "2000-01-01"
+    inputs = {
+        "strategy_prompt": request.prompt,
+        "start_date":      start_date,
+    }
     final_state = langgraph_app.invoke(inputs)
     end_date = datetime.now().strftime("%Y-%m-%d")
 
     if final_state.get("error"):
-        return {"error": final_state["error"]}
+        return {
+            "error":          final_state["error"],
+            "generated_code": final_state.get("generated_code", ""),
+        }
 
     best = final_state["best_config_so_far"]
     m    = best.get("metrics", {})
 
-    # Generate plain-English explanation
     explanation = ""
     try:
         explanation = _call_gemini(_EXPLAIN_PROMPT.format(
@@ -102,7 +115,6 @@ def run_backtest_endpoint(request: BacktestRequest, db: Session = Depends(get_db
     except Exception as e:
         explanation = f"Could not generate explanation: {e}"
 
-    # Persist to DB
     strategy_record = Strategy(
         user_prompt=request.prompt,
         generated_python_code=final_state["generated_code"],
@@ -127,9 +139,12 @@ def run_backtest_endpoint(request: BacktestRequest, db: Session = Depends(get_db
         ))
     db.commit()
 
-    benchmark_values = _fetch_benchmark(
-        request.benchmark_ticker, BACKTEST_START, end_date
-    )
+    # Align benchmark to the actual portfolio date range so idle pre-data
+    # years don't extend the benchmark chart beyond the strategy's window.
+    portfolio_values = m.get("portfolio_values", [])
+    bm_start = portfolio_values[0]["date"]  if portfolio_values else start_date
+    bm_end   = portfolio_values[-1]["date"] if portfolio_values else end_date
+    benchmark_values = _fetch_benchmark(request.benchmark_ticker, bm_start, bm_end)
 
     return {
         "strategy_id":        strategy_record.id,
@@ -139,6 +154,98 @@ def run_backtest_endpoint(request: BacktestRequest, db: Session = Depends(get_db
         "explanation":        explanation,
         "benchmark_ticker":   request.benchmark_ticker,
         "benchmark_values":   benchmark_values,
+    }
+
+
+@app.post("/api/screen-backtest")
+def run_screened_backtest(request: ScreenedBacktestRequest, db: Session = Depends(get_db)):
+    end_date = request.end_date or datetime.now().strftime("%Y-%m-%d")
+    inputs = {
+        "strategy_prompt":  request.strategy_prompt,
+        "screening_prompt": request.screening_prompt,
+        "start_date":       request.start_date or "",
+        "end_date":         end_date,
+    }
+    final_state = multi_app.invoke(inputs)
+
+    if final_state.get("error"):
+        return {
+            "error":          final_state["error"],
+            "generated_code": final_state.get("generated_code", ""),
+            "screening_code": final_state.get("screening_code", ""),
+        }
+
+    best = final_state["best_config_so_far"]
+    m    = best.get("metrics", {})
+
+    explanation = ""
+    try:
+        explanation = _call_gemini(_EXPLAIN_PROMPT.format(
+            prompt=f"[Screening] {request.screening_prompt}\n[Strategy] {request.strategy_prompt}",
+            config=json.dumps(best.get("config", {}), indent=2),
+            cagr=m.get("cagr", 0),
+            total_return=m.get("total_return_pct", 0),
+            max_drawdown=m.get("max_drawdown", 0),
+            win_rate=m.get("win_rate", 0),
+            expectancy=m.get("expectancy", 0),
+            total_trades=m.get("total_trades", 0),
+            final_value=m.get("final_portfolio_value", 0),
+        ))
+    except Exception as e:
+        explanation = f"Could not generate explanation: {e}"
+
+    strategy_record = Strategy(
+        user_prompt=f"[SCREENED] {request.screening_prompt} | {request.strategy_prompt}",
+        generated_python_code=final_state.get("generated_code", ""),
+        timestamp=datetime.now().isoformat(),
+    )
+    db.add(strategy_record)
+    db.commit()
+    db.refresh(strategy_record)
+
+    for it in final_state.get("all_iteration_results", []):
+        met = it["metrics"]
+        db.add(BacktestIteration(
+            strategy_id=strategy_record.id,
+            iteration_number=it["iteration"],
+            config_json=json.dumps(it["config"]),
+            cagr=met.get("cagr"),
+            max_drawdown=met.get("max_drawdown"),
+            avg_win=met.get("avg_win"),
+            avg_loss=met.get("avg_loss"),
+            win_rate=met.get("win_rate"),
+            expectancy=met.get("expectancy"),
+        ))
+    db.commit()
+
+    # Summarise which tickers were traded
+    screening_dict = final_state.get("screening_dict", {})
+
+    # Align benchmark to the actual trading window derived from the (already
+    # trimmed) equity curve so pre-trade idle years don't stretch the chart.
+    portfolio_values = m.get("portfolio_values", [])
+    bm_start = portfolio_values[0]["date"]  if portfolio_values else (request.start_date or "2000-01-01")
+    bm_end   = portfolio_values[-1]["date"] if portfolio_values else end_date
+    benchmark_values = _fetch_benchmark(request.benchmark_ticker, bm_start, bm_end)
+    unique_tickers = sorted({t for v in screening_dict.values() for t in v})
+
+    return {
+        "strategy_id":        strategy_record.id,
+        "best_configuration":  best,
+        "all_iterations":     final_state.get("all_iteration_results", []),
+        "generated_code":     final_state.get("generated_code", ""),
+        "screening_code":     final_state.get("screening_code", ""),
+        "explanation":        explanation,
+        "benchmark_ticker":   request.benchmark_ticker,
+        "benchmark_values":   benchmark_values,
+        "screening_summary": {
+            "unique_tickers":    unique_tickers,
+            "total_ticker_days": sum(len(v) for v in screening_dict.values()),
+            "date_range":        {
+                "start": min(screening_dict.keys()) if screening_dict else None,
+                "end":   max(screening_dict.keys()) if screening_dict else None,
+            },
+        },
     }
 
 

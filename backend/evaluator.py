@@ -9,6 +9,7 @@ Exports used by graph.py:
 import numpy as np
 import backtrader as bt
 import backtrader.analyzers as btanalyzers
+from datetime import datetime
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +165,26 @@ def get_metrics(cerebro, results):
     portfolio_values = []
     if hasattr(strat.analyzers, "portfolio"):
         portfolio_values = strat.analyzers.portfolio.get_analysis()
+
+    # Trim leading flat section (strategy not yet trading) and recompute CAGR
+    # from the trimmed window so a 55-year idle period doesn't dilute metrics.
+    if portfolio_values and len(portfolio_values) > 1:
+        initial_pv = portfolio_values[0]["value"]
+        first_active = next(
+            (i for i, e in enumerate(portfolio_values) if abs(e["value"] - initial_pv) > 0.01),
+            None,
+        )
+        if first_active is not None and first_active > 1:
+            portfolio_values = portfolio_values[max(0, first_active - 1):]
+            if len(portfolio_values) >= 2:
+                pv_first = portfolio_values[0]["value"]
+                pv_last  = portfolio_values[-1]["value"]
+                days = (
+                    datetime.strptime(portfolio_values[-1]["date"], "%Y-%m-%d") -
+                    datetime.strptime(portfolio_values[0]["date"],  "%Y-%m-%d")
+                ).days
+                if days > 0 and pv_first > 0 and pv_last > 0:
+                    cagr = round(((pv_last / pv_first) ** (365.25 / days) - 1) * 100, 4)
 
     return {
         "cagr":                  cagr,

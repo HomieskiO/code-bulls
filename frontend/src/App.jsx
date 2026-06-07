@@ -147,11 +147,14 @@ function downloadJSON(data, filename) {
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function App() {
+  const [mode,             setMode]             = useState('single')   // 'single' | 'screened'
   const [messages,         setMessages]         = useState([{
     type: 'ai',
     content: "Welcome to AlgoTrader AI.\n\nDescribe your trading strategy and I'll backtest and optimize it for you.",
   }])
   const [input,            setInput]            = useState("Trade AAPL. Buy when the 15-day EMA crosses above the 50-day EMA. Sell when it crosses below.")
+  const [screeningInput,   setScreeningInput]   = useState("Top 1% of stocks with the biggest price move over the past 1 month")
+  const [strategyInput,    setStrategyInput]    = useState("Buy when RSI drops below 35 (oversold). Sell when RSI rises above 65.")
   const [loading,          setLoading]          = useState(false)
   const [results,          setResults]          = useState(null)
   const [activeTab,        setActiveTab]        = useState('dashboard')
@@ -159,6 +162,7 @@ export default function App() {
   const [history,          setHistory]          = useState(null)
   const [benchmarkTicker,  setBenchmarkTicker]  = useState('SPY')
   const [benchmarkInput,   setBenchmarkInput]   = useState('SPY')
+  const [debugData,        setDebugData]        = useState(null)   // partial data on failed runs
   const chatEnd = useRef(null)
 
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
@@ -179,49 +183,114 @@ export default function App() {
   }
 
   const run = async () => {
-    if (!input.trim() || loading) return
-    const prompt = input.trim()
-    setInput('')
+    const isScreened = mode === 'screened'
+    const canRun = isScreened
+      ? (screeningInput.trim() && strategyInput.trim())
+      : input.trim()
+    if (!canRun || loading) return
+
     setLoading(true)
 
-    setMessages(prev => [
-      ...prev,
-      { type: 'user', content: prompt },
-      { type: 'ai',   content: 'Running backtest & optimizing…', thinking: true },
-    ])
-
-    try {
-      const res  = await fetch('/api/backtest', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, benchmark_ticker: benchmarkTicker }),
-      })
-      const data = await res.json()
-      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`)
-
-      setResults(data)
-      setActiveTab('dashboard')
-      setHistory(null) // refresh history next time
-
-      const m    = data.best_configuration?.metrics ?? {}
-      const n    = data.all_iterations?.length ?? 0
-
+    if (isScreened) {
+      const userMsg = `[Screening] ${screeningInput.trim()}\n[Strategy] ${strategyInput.trim()}`
       setMessages(prev => [
-        ...prev.slice(0, -1),
-        {
-          type: 'ai',
-          content: `Optimization complete after ${n} iteration${n !== 1 ? 's' : ''}.\n\n` +
-            `CAGR: ${pct(m.cagr)} | Drawdown: ${pct(m.max_drawdown)} | Win Rate: ${pct(m.win_rate)}\n\n` +
-            `Full results, charts & explanation are on the right →`,
-        },
+        ...prev,
+        { type: 'user', content: userMsg },
+        { type: 'ai',   content: 'Generating screener code, running screening, then backtesting…', thinking: true },
       ])
-    } catch (err) {
+      try {
+        const res  = await fetch('/api/screen-backtest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            strategy_prompt:  strategyInput.trim(),
+            screening_prompt: screeningInput.trim(),
+            benchmark_ticker: benchmarkTicker,
+          }),
+        })
+        const data = await res.json()
+        if (!res.ok || data.error) {
+          if (data.generated_code || data.screening_code) {
+            setDebugData({ error: data.error || `HTTP ${res.status}`, generated_code: data.generated_code || '', screening_code: data.screening_code || '' })
+            setActiveTab('code')
+          }
+          throw new Error(data.error || `HTTP ${res.status}`)
+        }
+
+        setDebugData(null)
+        setResults({ ...data, _mode: 'screened' })
+        setActiveTab('dashboard')
+        setHistory(null)
+
+        const m = data.best_configuration?.metrics ?? {}
+        const n = data.all_iterations?.length ?? 0
+        const s = data.screening_summary ?? {}
+        setMessages(prev => [
+          ...prev.slice(0, -1),
+          {
+            type: 'ai',
+            content:
+              `Screened backtest complete after ${n} iteration${n !== 1 ? 's' : ''}.\n\n` +
+              `Tickers traded: ${s.unique_tickers?.length ?? 0} unique symbols across ${Object.keys({}).length} dates\n` +
+              `CAGR: ${pct(m.cagr)} | Drawdown: ${pct(m.max_drawdown)} | Win Rate: ${pct(m.win_rate)}\n\n` +
+              `Full results, charts & explanation are on the right →`,
+          },
+        ])
+      } catch (err) {
+        setMessages(prev => [
+          ...prev.slice(0, -1),
+          { type: 'ai', content: `Error: ${err.message}` },
+        ])
+      } finally {
+        setLoading(false)
+      }
+    } else {
+      const prompt = input.trim()
+      setInput('')
       setMessages(prev => [
-        ...prev.slice(0, -1),
-        { type: 'ai', content: `Error: ${err.message}` },
+        ...prev,
+        { type: 'user', content: prompt },
+        { type: 'ai',   content: 'Running backtest & optimizing…', thinking: true },
       ])
-    } finally {
-      setLoading(false)
+      try {
+        const res  = await fetch('/api/backtest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt, benchmark_ticker: benchmarkTicker }),
+        })
+        const data = await res.json()
+        if (!res.ok || data.error) {
+          if (data.generated_code) {
+            setDebugData({ error: data.error || `HTTP ${res.status}`, generated_code: data.generated_code, screening_code: '' })
+            setActiveTab('code')
+          }
+          throw new Error(data.error || `HTTP ${res.status}`)
+        }
+
+        setDebugData(null)
+        setResults({ ...data, _mode: 'single' })
+        setActiveTab('dashboard')
+        setHistory(null)
+
+        const m = data.best_configuration?.metrics ?? {}
+        const n = data.all_iterations?.length ?? 0
+        setMessages(prev => [
+          ...prev.slice(0, -1),
+          {
+            type: 'ai',
+            content: `Optimization complete after ${n} iteration${n !== 1 ? 's' : ''}.\n\n` +
+              `CAGR: ${pct(m.cagr)} | Drawdown: ${pct(m.max_drawdown)} | Win Rate: ${pct(m.win_rate)}\n\n` +
+              `Full results, charts & explanation are on the right →`,
+          },
+        ])
+      } catch (err) {
+        setMessages(prev => [
+          ...prev.slice(0, -1),
+          { type: 'ai', content: `Error: ${err.message}` },
+        ])
+      } finally {
+        setLoading(false)
+      }
     }
   }
 
@@ -331,60 +400,129 @@ export default function App() {
           </div>
 
           <div style={{ padding: 10, borderTop: `1px solid ${C.border}`, background: C.bg }}>
-            <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden' }}>
-              <textarea
-                value={input}
-                onChange={e => setInput(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); run() } }}
-                placeholder="Describe your trading strategy…"
-                disabled={loading}
-                rows={3}
-                style={{
-                  width: '100%', padding: '11px 13px',
-                  background: 'transparent', border: 'none',
-                  color: C.text, fontSize: 13.5, resize: 'none', lineHeight: 1.5,
-                }}
-              />
-              <div style={{
-                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                padding: '7px 11px', borderTop: `1px solid ${C.border}`,
-              }}>
-                <span style={{ fontSize: 11, color: C.muted }}>↵ send · ⇧↵ newline</span>
-                <button
-                  onClick={run}
-                  disabled={loading || !input.trim()}
-                  style={{
-                    background: loading || !input.trim() ? C.border : `linear-gradient(135deg,${C.accent},${C.purple})`,
-                    border: 'none', borderRadius: 8, padding: '6px 14px',
-                    color: loading || !input.trim() ? C.muted : '#fff',
-                    fontWeight: 600, fontSize: 13,
-                    display: 'flex', alignItems: 'center', gap: 6, transition: 'all .2s',
-                    cursor: loading || !input.trim() ? 'not-allowed' : 'pointer',
-                  }}
-                >
-                  {loading
-                    ? <span style={{ width: 13, height: 13, border: `2px solid ${C.muted}`, borderTopColor: C.accent, borderRadius: '50%', display: 'inline-block', animation: 'spin .8s linear infinite' }} />
-                    : '▶'}
-                  {loading ? 'Running' : 'Run'}
-                </button>
-              </div>
-            </div>
 
-            <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
+            {/* Mode switcher */}
+            <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
               {[
-                'AAPL 15/50 EMA crossover, 2020–2024',
-                'SPY RSI(14) oversold <30 strategy',
-                'TSLA Bollinger Bands breakout',
-              ].map(s => (
-                <button key={s} onClick={() => setInput(s)} style={{
-                  background: C.card, border: `1px solid ${C.border}`, borderRadius: 8,
-                  padding: '6px 12px', color: C.muted, fontSize: 12, textAlign: 'left', cursor: 'pointer',
-                }}
-                  onMouseEnter={e => e.currentTarget.style.color = C.text}
-                  onMouseLeave={e => e.currentTarget.style.color = C.muted}
-                >{s}</button>
+                { id: 'single',   label: 'Single Stock' },
+                { id: 'screened', label: 'Screened Multi-Stock' },
+              ].map(m => (
+                <button
+                  key={m.id}
+                  onClick={() => setMode(m.id)}
+                  style={{
+                    flex: 1, padding: '6px 0', border: 'none', borderRadius: 8,
+                    fontFamily: 'inherit', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                    background: mode === m.id ? C.accent + '33' : C.card,
+                    color: mode === m.id ? C.accent : C.muted,
+                    borderBottom: mode === m.id ? `2px solid ${C.accent}` : `2px solid ${C.border}`,
+                    transition: 'all .15s',
+                  }}
+                >{m.label}</button>
               ))}
             </div>
+
+            {mode === 'single' ? (
+              /* ── Single-stock input ── */
+              <>
+                <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden' }}>
+                  <textarea
+                    value={input}
+                    onChange={e => setInput(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); run() } }}
+                    placeholder="Describe your trading strategy…"
+                    disabled={loading}
+                    rows={3}
+                    style={{
+                      width: '100%', padding: '11px 13px',
+                      background: 'transparent', border: 'none',
+                      color: C.text, fontSize: 13.5, resize: 'none', lineHeight: 1.5,
+                    }}
+                  />
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 11px', borderTop: `1px solid ${C.border}` }}>
+                    <span style={{ fontSize: 11, color: C.muted }}>↵ send · ⇧↵ newline</span>
+                    <RunButton loading={loading} disabled={!input.trim()} onClick={run} />
+                  </div>
+                </div>
+                <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  {[
+                    'AAPL 15/50 EMA crossover',
+                    'SPY RSI(14) oversold <30 strategy',
+                    'TSLA Bollinger Bands breakout',
+                  ].map(s => (
+                    <button key={s} onClick={() => setInput(s)} style={{
+                      background: C.card, border: `1px solid ${C.border}`, borderRadius: 8,
+                      padding: '6px 12px', color: C.muted, fontSize: 12, textAlign: 'left', cursor: 'pointer',
+                    }}
+                      onMouseEnter={e => e.currentTarget.style.color = C.text}
+                      onMouseLeave={e => e.currentTarget.style.color = C.muted}
+                    >{s}</button>
+                  ))}
+                </div>
+              </>
+            ) : (
+              /* ── Screened multi-stock input ── */
+              <>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden' }}>
+                    <p style={{ padding: '7px 13px 0', fontSize: 10, fontWeight: 700, color: C.accent, textTransform: 'uppercase', letterSpacing: '.06em' }}>
+                      Stock Screening Logic
+                    </p>
+                    <textarea
+                      value={screeningInput}
+                      onChange={e => setScreeningInput(e.target.value)}
+                      placeholder="e.g. top 1% of stocks by 1-month return"
+                      disabled={loading}
+                      rows={2}
+                      style={{
+                        width: '100%', padding: '6px 13px 10px',
+                        background: 'transparent', border: 'none',
+                        color: C.text, fontSize: 13, resize: 'none', lineHeight: 1.5,
+                      }}
+                    />
+                  </div>
+                  <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden' }}>
+                    <p style={{ padding: '7px 13px 0', fontSize: 10, fontWeight: 700, color: C.purple, textTransform: 'uppercase', letterSpacing: '.06em' }}>
+                      Trading Strategy
+                    </p>
+                    <textarea
+                      value={strategyInput}
+                      onChange={e => setStrategyInput(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); run() } }}
+                      placeholder="e.g. buy when RSI < 35, sell when RSI > 65"
+                      disabled={loading}
+                      rows={2}
+                      style={{
+                        width: '100%', padding: '6px 13px 10px',
+                        background: 'transparent', border: 'none',
+                        color: C.text, fontSize: 13, resize: 'none', lineHeight: 1.5,
+                      }}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                    <RunButton loading={loading} disabled={!screeningInput.trim() || !strategyInput.trim()} onClick={run} />
+                  </div>
+                </div>
+                <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  {[
+                    { screen: 'Top 1% stocks by 1-month return', strategy: 'Buy on RSI < 35, sell on RSI > 65' },
+                    { screen: 'Stocks with 3x average volume spike', strategy: 'EMA 10/30 crossover strategy' },
+                    { screen: 'Stocks breaking above their 52-week high', strategy: 'Buy breakout, sell when price drops below EMA 20' },
+                  ].map(({ screen, strategy }) => (
+                    <button key={screen} onClick={() => { setScreeningInput(screen); setStrategyInput(strategy) }} style={{
+                      background: C.card, border: `1px solid ${C.border}`, borderRadius: 8,
+                      padding: '6px 12px', color: C.muted, fontSize: 11, textAlign: 'left', cursor: 'pointer',
+                    }}
+                      onMouseEnter={e => e.currentTarget.style.color = C.text}
+                      onMouseLeave={e => e.currentTarget.style.color = C.muted}
+                    >
+                      <span style={{ color: C.accent }}>Screen:</span> {screen}<br />
+                      <span style={{ color: C.purple }}>Strategy:</span> {strategy}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
           </div>
         </div>
 
@@ -416,6 +554,37 @@ export default function App() {
                 <EmptyState onSelect={setInput} />
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
+
+                  {/* Screening Summary (screened mode only) */}
+                  {results._mode === 'screened' && results.screening_summary && (
+                    <section>
+                      <Label>Screening Summary</Label>
+                      <Card style={{ padding: '14px 18px' }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 12 }}>
+                          <MetricCard title="Unique Tickers" display={results.screening_summary.unique_tickers?.length ?? 0} color={C.accent} />
+                          <MetricCard title="Ticker-Day Pairs" display={(results.screening_summary.total_ticker_days ?? 0).toLocaleString()} color={C.purple} />
+                          <MetricCard title="Date Range"
+                            display={`${results.screening_summary.date_range?.start?.slice(0,7) ?? '?'} → ${results.screening_summary.date_range?.end?.slice(0,7) ?? '?'}`}
+                            color={C.muted}
+                          />
+                        </div>
+                        {results.screening_summary.unique_tickers?.length > 0 && (
+                          <div style={{ marginTop: 12 }}>
+                            <p style={{ fontSize: 11, color: C.muted, marginBottom: 6 }}>Tickers in screening universe</p>
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, maxHeight: 72, overflowY: 'auto' }}>
+                              {results.screening_summary.unique_tickers.map(t => (
+                                <span key={t} style={{
+                                  background: C.surface, border: `1px solid ${C.border}`,
+                                  borderRadius: 5, padding: '2px 7px',
+                                  fontSize: 11, fontFamily: 'monospace', color: C.accent,
+                                }}>{t}</span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </Card>
+                    </section>
+                  )}
 
                   {/* AI Explanation */}
                   {explain && (
@@ -741,57 +910,88 @@ export default function App() {
             )}
 
             {/* ── CODE TAB ──────────────────────────────────────────── */}
-            {activeTab === 'code' && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <Label>Generated Backtrader Strategy</Label>
-                  {genCode && (
-                    <button
-                      onClick={() => {
-                        const blob = new Blob([genCode], { type: 'text/x-python' })
-                        const url  = URL.createObjectURL(blob)
-                        const a    = document.createElement('a')
-                        a.href = url; a.download = `strategy_${results?.strategy_id ?? 'run'}.py`; a.click()
-                        URL.revokeObjectURL(url)
-                      }}
-                      style={{
-                        background: C.purple + '22', border: `1px solid ${C.purple}55`,
-                        borderRadius: 8, padding: '5px 12px', color: C.purple,
-                        fontSize: 12, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5,
-                      }}
-                    >⬇ Download .py</button>
-                  )}
-                </div>
-                {!genCode ? (
-                  <div style={{ textAlign: 'center', padding: '48px 0', color: C.muted }}>
-                    <div style={{ fontSize: 48, marginBottom: 12 }}>🧑‍💻</div>
-                    <p>Run a backtest to see the generated strategy code.</p>
-                  </div>
-                ) : (
-                  <Card style={{ overflow: 'hidden' }}>
+            {activeTab === 'code' && (() => {
+              const codeSource  = results ?? debugData
+              const dispCode    = codeSource?.generated_code ?? genCode
+              const screenCode  = codeSource?.screening_code ?? results?.screening_code ?? ''
+              const errorMsg    = debugData?.error ?? null
+              const runId       = results?.strategy_id ?? 'run'
+
+              const downloadPy = (code, name) => {
+                const blob = new Blob([code], { type: 'text/x-python' })
+                const url  = URL.createObjectURL(blob)
+                const a    = document.createElement('a'); a.href = url; a.download = name; a.click()
+                URL.revokeObjectURL(url)
+              }
+
+              return (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+                  {/* Error banner (only when the run failed) */}
+                  {errorMsg && (
                     <div style={{
-                      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                      padding: '10px 16px', borderBottom: `1px solid ${C.border}`,
-                      background: C.surface,
+                      background: C.danger + '15', border: `1px solid ${C.danger}55`,
+                      borderRadius: 10, padding: '14px 18px',
+                      display: 'flex', gap: 12, alignItems: 'flex-start',
                     }}>
-                      <span style={{ fontSize: 12, color: C.muted, fontFamily: 'monospace' }}>strategy.py</span>
-                      <div style={{ display: 'flex', gap: 5 }}>
-                        {['#ef4444','#f59e0b','#10b981'].map(c => (
-                          <div key={c} style={{ width: 10, height: 10, borderRadius: '50%', background: c }}/>
-                        ))}
+                      <span style={{ fontSize: 18, flexShrink: 0 }}>❌</span>
+                      <div>
+                        <p style={{ fontWeight: 700, color: C.danger, fontSize: 13, marginBottom: 4 }}>Run failed — showing generated code for debugging</p>
+                        <pre style={{ color: C.text, fontSize: 12, lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0 }}>{errorMsg}</pre>
                       </div>
                     </div>
-                    <pre style={{
-                      padding: '16px 18px', margin: 0,
-                      fontFamily: "'JetBrains Mono', 'Fira Code', 'Courier New', monospace",
-                      fontSize: 13, lineHeight: 1.65,
-                      color: '#a5f3fc', background: 'transparent',
-                      overflowX: 'auto', whiteSpace: 'pre',
-                    }}>{genCode}</pre>
-                  </Card>
-                )}
-              </div>
-            )}
+                  )}
+
+                  {/* Screening code block */}
+                  {screenCode ? (
+                    <div>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                        <Label>Generated Screening Code</Label>
+                        <button
+                          onClick={() => downloadPy(screenCode, `screening_${runId}.py`)}
+                          style={{ background: C.warning + '22', border: `1px solid ${C.warning}55`, borderRadius: 8, padding: '5px 12px', color: C.warning, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                        >⬇ Download .py</button>
+                      </div>
+                      <Card style={{ overflow: 'hidden' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 16px', borderBottom: `1px solid ${C.border}`, background: C.surface }}>
+                          <span style={{ fontSize: 12, color: C.warning, fontFamily: 'monospace' }}>screening.py</span>
+                          <div style={{ display: 'flex', gap: 5 }}>{['#ef4444','#f59e0b','#10b981'].map(c => <div key={c} style={{ width: 10, height: 10, borderRadius: '50%', background: c }}/>)}</div>
+                        </div>
+                        <pre style={{ padding: '16px 18px', margin: 0, fontFamily: "'JetBrains Mono','Fira Code','Courier New',monospace", fontSize: 13, lineHeight: 1.65, color: '#fde68a', background: 'transparent', overflowX: 'auto', whiteSpace: 'pre' }}>{screenCode}</pre>
+                      </Card>
+                    </div>
+                  ) : null}
+
+                  {/* Strategy code block */}
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                      <Label>Generated Backtrader Strategy</Label>
+                      {dispCode && (
+                        <button
+                          onClick={() => downloadPy(dispCode, `strategy_${runId}.py`)}
+                          style={{ background: C.purple + '22', border: `1px solid ${C.purple}55`, borderRadius: 8, padding: '5px 12px', color: C.purple, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                        >⬇ Download .py</button>
+                      )}
+                    </div>
+                    {!dispCode ? (
+                      <div style={{ textAlign: 'center', padding: '48px 0', color: C.muted }}>
+                        <div style={{ fontSize: 48, marginBottom: 12 }}>🧑‍💻</div>
+                        <p>Run a backtest to see the generated strategy code.</p>
+                      </div>
+                    ) : (
+                      <Card style={{ overflow: 'hidden' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 16px', borderBottom: `1px solid ${C.border}`, background: C.surface }}>
+                          <span style={{ fontSize: 12, color: C.muted, fontFamily: 'monospace' }}>strategy.py</span>
+                          <div style={{ display: 'flex', gap: 5 }}>{['#ef4444','#f59e0b','#10b981'].map(c => <div key={c} style={{ width: 10, height: 10, borderRadius: '50%', background: c }}/>)}</div>
+                        </div>
+                        <pre style={{ padding: '16px 18px', margin: 0, fontFamily: "'JetBrains Mono','Fira Code','Courier New',monospace", fontSize: 13, lineHeight: 1.65, color: '#a5f3fc', background: 'transparent', overflowX: 'auto', whiteSpace: 'pre' }}>{dispCode}</pre>
+                      </Card>
+                    )}
+                  </div>
+
+                </div>
+              )
+            })()}
 
             {/* ── HISTORY TAB ───────────────────────────────────────── */}
             {activeTab === 'history' && (
@@ -947,6 +1147,29 @@ function EmptyState({ onSelect }) {
         ))}
       </div>
     </div>
+  )
+}
+
+function RunButton({ loading, disabled, onClick }) {
+  const off = loading || disabled
+  return (
+    <button
+      onClick={onClick}
+      disabled={off}
+      style={{
+        background: off ? C.border : `linear-gradient(135deg,${C.accent},${C.purple})`,
+        border: 'none', borderRadius: 8, padding: '6px 14px',
+        color: off ? C.muted : '#fff',
+        fontWeight: 600, fontSize: 13,
+        display: 'flex', alignItems: 'center', gap: 6, transition: 'all .2s',
+        cursor: off ? 'not-allowed' : 'pointer',
+      }}
+    >
+      {loading
+        ? <span style={{ width: 13, height: 13, border: `2px solid ${C.muted}`, borderTopColor: C.accent, borderRadius: '50%', display: 'inline-block', animation: 'spin .8s linear infinite' }} />
+        : '▶'}
+      {loading ? 'Running' : 'Run'}
+    </button>
   )
 }
 
