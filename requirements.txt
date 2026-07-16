@@ -8,3 +8,5 @@ langgraph
 google-genai
 python-dotenv
 google-generativeai
+# Optional: official Ollama Python client (HTTP fallback works without it)
+# ollama

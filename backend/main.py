@@ -1,8 +1,8 @@
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 import json
-from datetime import datetime
+from datetime import datetime, date
 import pandas as pd
 import yfinance as yf
 
@@ -11,6 +11,11 @@ from database import SessionLocal, Strategy, BacktestIteration
 
 app = FastAPI()
 
+# Last bar available in Stock Market Dataset (Stocks/ + ETFs/)
+DATASET_MAX_END = "2017-11-10"
+DEFAULT_START   = "2010-01-01"
+DEFAULT_END     = DATASET_MAX_END
+
 
 def get_db():
     db = SessionLocal()
@@ -18,6 +23,41 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def _parse_ymd(value: str, field: str) -> date:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} must be YYYY-MM-DD, got {value!r}",
+        )
+
+
+def _normalize_period(start_date: str, end_date: str) -> tuple[str, str]:
+    """
+    Apply defaults and hard-cap end at the dataset max date.
+    Raises HTTPException on invalid ranges.
+    """
+    start = (start_date or DEFAULT_START).strip()
+    end   = (end_date   or DEFAULT_END).strip()
+
+    start_d = _parse_ymd(start, "start_date")
+    end_d   = _parse_ymd(end,   "end_date")
+    max_d   = _parse_ymd(DATASET_MAX_END, "DATASET_MAX_END")
+
+    if end_d > max_d:
+        end_d = max_d
+        end   = DATASET_MAX_END
+
+    if start_d >= end_d:
+        raise HTTPException(
+            status_code=400,
+            detail=f"start_date ({start}) must be before end_date ({end})",
+        )
+
+    return start, end
 
 
 def _fetch_benchmark(ticker: str, start: str, end: str, initial_value: float = 100_000) -> list:
@@ -41,28 +81,43 @@ def _fetch_benchmark(ticker: str, start: str, end: str, initial_value: float = 1
         return []
 
 
+def _normalize_position_size_pct(value, default: float) -> float:
+    """Percent of available cash per trade (1–100)."""
+    try:
+        v = float(value if value is not None else default)
+    except (TypeError, ValueError):
+        v = default
+    return max(1.0, min(100.0, v))
+
+
 class BacktestRequest(BaseModel):
-    prompt:           str
-    start_date:       str = ""          # "" = use earliest available (no 2015 limit)
-    benchmark_ticker: str = "SPY"
+    prompt:              str
+    start_date:          str = DEFAULT_START
+    end_date:            str = DEFAULT_END
+    benchmark_ticker:    str = "SPY"
+    # % of available cash allocated to each new trade (single-stock default: 100)
+    position_size_pct:   float = 100.0
 
 
 class ScreenedBacktestRequest(BaseModel):
-    strategy_prompt:  str
-    screening_prompt: str               # natural language screening description
-    start_date:       str = ""
-    end_date:         str = ""
-    benchmark_ticker: str = "SPY"
+    strategy_prompt:     str
+    screening_prompt:    str               # natural language screening description
+    start_date:          str = DEFAULT_START
+    end_date:            str = DEFAULT_END
+    benchmark_ticker:    str = "SPY"
+    # % of available cash per new position (multi-stock default: 10)
+    position_size_pct:   float = 10.0
 
 
 _EXPLAIN_PROMPT = """
 You are a quantitative trading analyst. An AI just optimized a trading strategy and found the best configuration. Explain it clearly to the user.
 
 Original strategy request: "{prompt}"
+Backtest period: {period_start} → {period_end}
 
 Best configuration found: {config}
 
-Performance metrics:
+Performance metrics (relative to the backtest period above):
 - CAGR: {cagr}%
 - Total Return: {total_return}%
 - Max Drawdown: {max_drawdown}%
@@ -73,7 +128,7 @@ Performance metrics:
 
 Write 3–4 concise sentences covering:
 1. What the best configuration parameters mean in plain English
-2. How the strategy performed overall (strengths)
+2. How the strategy performed over the backtest period (strengths)
 3. Key risks or weaknesses to be aware of
 
 Use plain language. No markdown headers or bullet points — just flowing prose.
@@ -82,18 +137,22 @@ Use plain language. No markdown headers or bullet points — just flowing prose.
 
 @app.post("/api/backtest")
 def run_backtest_endpoint(request: BacktestRequest, db: Session = Depends(get_db)):
-    start_date = request.start_date or "2000-01-01"
+    start_date, end_date = _normalize_period(request.start_date, request.end_date)
+    position_size_pct = _normalize_position_size_pct(request.position_size_pct, 100.0)
     inputs = {
-        "strategy_prompt": request.prompt,
-        "start_date":      start_date,
+        "strategy_prompt":   request.prompt,
+        "start_date":        start_date,
+        "end_date":          end_date,
+        "position_size_pct": position_size_pct,
     }
     final_state = langgraph_app.invoke(inputs)
-    end_date = datetime.now().strftime("%Y-%m-%d")
 
     if final_state.get("error"):
         return {
             "error":          final_state["error"],
             "generated_code": final_state.get("generated_code", ""),
+            "period":         {"start": start_date, "end": end_date},
+            "position_size_pct": position_size_pct,
         }
 
     best = final_state["best_config_so_far"]
@@ -103,6 +162,8 @@ def run_backtest_endpoint(request: BacktestRequest, db: Session = Depends(get_db
     try:
         explanation = _call_gemini(_EXPLAIN_PROMPT.format(
             prompt=request.prompt,
+            period_start=start_date,
+            period_end=end_date,
             config=json.dumps(best.get("config", {}), indent=2),
             cagr=m.get("cagr", 0),
             total_return=m.get("total_return_pct", 0),
@@ -139,11 +200,10 @@ def run_backtest_endpoint(request: BacktestRequest, db: Session = Depends(get_db
         ))
     db.commit()
 
-    # Align benchmark to the actual portfolio date range so idle pre-data
-    # years don't extend the benchmark chart beyond the strategy's window.
+    # Benchmark over the same user-requested period (or actual equity window)
     portfolio_values = m.get("portfolio_values", [])
-    bm_start = portfolio_values[0]["date"]  if portfolio_values else start_date
-    bm_end   = portfolio_values[-1]["date"] if portfolio_values else end_date
+    bm_start = m.get("period_start") or (portfolio_values[0]["date"]  if portfolio_values else start_date)
+    bm_end   = m.get("period_end")   or (portfolio_values[-1]["date"] if portfolio_values else end_date)
     benchmark_values = _fetch_benchmark(request.benchmark_ticker, bm_start, bm_end)
 
     return {
@@ -154,17 +214,24 @@ def run_backtest_endpoint(request: BacktestRequest, db: Session = Depends(get_db
         "explanation":        explanation,
         "benchmark_ticker":   request.benchmark_ticker,
         "benchmark_values":   benchmark_values,
+        "period": {
+            "start": start_date,
+            "end":   end_date,
+        },
+        "position_size_pct":  position_size_pct,
     }
 
 
 @app.post("/api/screen-backtest")
 def run_screened_backtest(request: ScreenedBacktestRequest, db: Session = Depends(get_db)):
-    end_date = request.end_date or datetime.now().strftime("%Y-%m-%d")
+    start_date, end_date = _normalize_period(request.start_date, request.end_date)
+    position_size_pct = _normalize_position_size_pct(request.position_size_pct, 10.0)
     inputs = {
-        "strategy_prompt":  request.strategy_prompt,
-        "screening_prompt": request.screening_prompt,
-        "start_date":       request.start_date or "",
-        "end_date":         end_date,
+        "strategy_prompt":   request.strategy_prompt,
+        "screening_prompt":  request.screening_prompt,
+        "start_date":        start_date,
+        "end_date":          end_date,
+        "position_size_pct": position_size_pct,
     }
     final_state = multi_app.invoke(inputs)
 
@@ -173,6 +240,8 @@ def run_screened_backtest(request: ScreenedBacktestRequest, db: Session = Depend
             "error":          final_state["error"],
             "generated_code": final_state.get("generated_code", ""),
             "screening_code": final_state.get("screening_code", ""),
+            "period":         {"start": start_date, "end": end_date},
+            "position_size_pct": position_size_pct,
         }
 
     best = final_state["best_config_so_far"]
@@ -182,6 +251,8 @@ def run_screened_backtest(request: ScreenedBacktestRequest, db: Session = Depend
     try:
         explanation = _call_gemini(_EXPLAIN_PROMPT.format(
             prompt=f"[Screening] {request.screening_prompt}\n[Strategy] {request.strategy_prompt}",
+            period_start=start_date,
+            period_end=end_date,
             config=json.dumps(best.get("config", {}), indent=2),
             cagr=m.get("cagr", 0),
             total_return=m.get("total_return_pct", 0),
@@ -221,11 +292,9 @@ def run_screened_backtest(request: ScreenedBacktestRequest, db: Session = Depend
     # Summarise which tickers were traded
     screening_dict = final_state.get("screening_dict", {})
 
-    # Align benchmark to the actual trading window derived from the (already
-    # trimmed) equity curve so pre-trade idle years don't stretch the chart.
     portfolio_values = m.get("portfolio_values", [])
-    bm_start = portfolio_values[0]["date"]  if portfolio_values else (request.start_date or "2000-01-01")
-    bm_end   = portfolio_values[-1]["date"] if portfolio_values else end_date
+    bm_start = m.get("period_start") or (portfolio_values[0]["date"]  if portfolio_values else start_date)
+    bm_end   = m.get("period_end")   or (portfolio_values[-1]["date"] if portfolio_values else end_date)
     benchmark_values = _fetch_benchmark(request.benchmark_ticker, bm_start, bm_end)
     unique_tickers = sorted({t for v in screening_dict.values() for t in v})
 
@@ -238,6 +307,11 @@ def run_screened_backtest(request: ScreenedBacktestRequest, db: Session = Depend
         "explanation":        explanation,
         "benchmark_ticker":   request.benchmark_ticker,
         "benchmark_values":   benchmark_values,
+        "period": {
+            "start": start_date,
+            "end":   end_date,
+        },
+        "position_size_pct": position_size_pct,
         "screening_summary": {
             "unique_tickers":    unique_tickers,
             "total_ticker_days": sum(len(v) for v in screening_dict.values()),

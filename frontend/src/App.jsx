@@ -146,15 +146,25 @@ function downloadJSON(data, filename) {
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
+// Dataset (Kaggle Stock Market) ends on 2017-11-10 — hard max for all backtests
+const DATASET_MAX_END = '2017-11-10'
+const DEFAULT_START   = '2010-01-01'
+const DEFAULT_END     = DATASET_MAX_END
+
 export default function App() {
   const [mode,             setMode]             = useState('single')   // 'single' | 'screened'
   const [messages,         setMessages]         = useState([{
     type: 'ai',
-    content: "Welcome to AlgoTrader AI.\n\nDescribe your trading strategy and I'll backtest and optimize it for you.",
+    content: "Welcome to AlgoTrader AI.\n\nDescribe your trading strategy, pick a start & end date, and I'll backtest and optimize it for you.",
   }])
   const [input,            setInput]            = useState("Trade AAPL. Buy when the 15-day EMA crosses above the 50-day EMA. Sell when it crosses below.")
   const [screeningInput,   setScreeningInput]   = useState("Top 1% of stocks with the biggest price move over the past 1 month")
-  const [strategyInput,    setStrategyInput]    = useState("Buy when RSI drops below 35 (oversold). Sell when RSI rises above 65.")
+  const [strategyInput,    setStrategyInput]    = useState("Buy when the stock reaches a new all-time high (ATH). Sell when it closes below the 50-day SMA.")
+  const [startDate,        setStartDate]        = useState(DEFAULT_START)
+  const [endDate,          setEndDate]          = useState(DEFAULT_END)
+  // Position sizing: % of available cash per trade (defaults differ by mode)
+  const [positionSizeSingle, setPositionSizeSingle] = useState(100)
+  const [positionSizeMulti,  setPositionSizeMulti]  = useState(10)
   const [loading,          setLoading]          = useState(false)
   const [results,          setResults]          = useState(null)
   const [activeTab,        setActiveTab]        = useState('dashboard')
@@ -164,6 +174,14 @@ export default function App() {
   const [benchmarkInput,   setBenchmarkInput]   = useState('SPY')
   const [debugData,        setDebugData]        = useState(null)   // partial data on failed runs
   const chatEnd = useRef(null)
+
+  const clampEnd = (d) => (d && d > DATASET_MAX_END ? DATASET_MAX_END : d)
+  const datesValid = Boolean(
+    startDate && endDate && startDate < endDate && endDate <= DATASET_MAX_END
+  )
+  const positionSizePct = mode === 'screened' ? positionSizeMulti : positionSizeSingle
+  const setPositionSizePct = mode === 'screened' ? setPositionSizeMulti : setPositionSizeSingle
+  const positionSizeValid = positionSizePct >= 1 && positionSizePct <= 100
 
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
 
@@ -189,10 +207,40 @@ export default function App() {
       : input.trim()
     if (!canRun || loading) return
 
+    if (!startDate || !endDate) {
+      setMessages(prev => [...prev, { type: 'ai', content: 'Please set both a start date and an end date before running.' }])
+      return
+    }
+    if (startDate >= endDate) {
+      setMessages(prev => [...prev, { type: 'ai', content: 'Start date must be before end date.' }])
+      return
+    }
+    if (endDate > DATASET_MAX_END) {
+      setMessages(prev => [...prev, {
+        type: 'ai',
+        content: `End date cannot be after ${DATASET_MAX_END} (last available date in the market dataset).`,
+      }])
+      return
+    }
+    if (!positionSizeValid) {
+      setMessages(prev => [...prev, {
+        type: 'ai',
+        content: 'Position size must be between 1% and 100% of available cash.',
+      }])
+      return
+    }
+
+    const periodStart = startDate
+    const periodEnd   = clampEnd(endDate)
+    const stakePct    = Math.min(100, Math.max(1, Number(positionSizePct) || (isScreened ? 10 : 100)))
+
     setLoading(true)
 
     if (isScreened) {
-      const userMsg = `[Screening] ${screeningInput.trim()}\n[Strategy] ${strategyInput.trim()}`
+      const userMsg =
+        `[Screening] ${screeningInput.trim()}\n[Strategy] ${strategyInput.trim()}\n` +
+        `[Period] ${periodStart} → ${periodEnd}\n` +
+        `[Position size] ${stakePct}% of available cash per trade`
       setMessages(prev => [
         ...prev,
         { type: 'user', content: userMsg },
@@ -203,9 +251,12 @@ export default function App() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            strategy_prompt:  strategyInput.trim(),
-            screening_prompt: screeningInput.trim(),
-            benchmark_ticker: benchmarkTicker,
+            strategy_prompt:    strategyInput.trim(),
+            screening_prompt:   screeningInput.trim(),
+            start_date:         periodStart,
+            end_date:           periodEnd,
+            benchmark_ticker:   benchmarkTicker,
+            position_size_pct:  stakePct,
           }),
         })
         const data = await res.json()
@@ -225,13 +276,15 @@ export default function App() {
         const m = data.best_configuration?.metrics ?? {}
         const n = data.all_iterations?.length ?? 0
         const s = data.screening_summary ?? {}
+        const period = data.period ?? { start: periodStart, end: periodEnd }
         setMessages(prev => [
           ...prev.slice(0, -1),
           {
             type: 'ai',
             content:
               `Screened backtest complete after ${n} iteration${n !== 1 ? 's' : ''}.\n\n` +
-              `Tickers traded: ${s.unique_tickers?.length ?? 0} unique symbols across ${Object.keys({}).length} dates\n` +
+              `Period: ${period.start} → ${period.end}\n` +
+              `Tickers traded: ${s.unique_tickers?.length ?? 0} unique symbols\n` +
               `CAGR: ${pct(m.cagr)} | Drawdown: ${pct(m.max_drawdown)} | Win Rate: ${pct(m.win_rate)}\n\n` +
               `Full results, charts & explanation are on the right →`,
           },
@@ -249,14 +302,25 @@ export default function App() {
       setInput('')
       setMessages(prev => [
         ...prev,
-        { type: 'user', content: prompt },
+        {
+          type: 'user',
+          content:
+            `${prompt}\n[Period] ${periodStart} → ${periodEnd}\n` +
+            `[Position size] ${stakePct}% of available cash per trade`,
+        },
         { type: 'ai',   content: 'Running backtest & optimizing…', thinking: true },
       ])
       try {
         const res  = await fetch('/api/backtest', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt, benchmark_ticker: benchmarkTicker }),
+          body: JSON.stringify({
+            prompt,
+            start_date: periodStart,
+            end_date: periodEnd,
+            benchmark_ticker: benchmarkTicker,
+            position_size_pct: stakePct,
+          }),
         })
         const data = await res.json()
         if (!res.ok || data.error) {
@@ -274,11 +338,13 @@ export default function App() {
 
         const m = data.best_configuration?.metrics ?? {}
         const n = data.all_iterations?.length ?? 0
+        const period = data.period ?? { start: periodStart, end: periodEnd }
         setMessages(prev => [
           ...prev.slice(0, -1),
           {
             type: 'ai',
             content: `Optimization complete after ${n} iteration${n !== 1 ? 's' : ''}.\n\n` +
+              `Period: ${period.start} → ${period.end}\n` +
               `CAGR: ${pct(m.cagr)} | Drawdown: ${pct(m.max_drawdown)} | Win Rate: ${pct(m.win_rate)}\n\n` +
               `Full results, charts & explanation are on the right →`,
           },
@@ -422,6 +488,24 @@ export default function App() {
               ))}
             </div>
 
+            {/* Backtest period — required for every strategy */}
+            <DateRangePicker
+              startDate={startDate}
+              endDate={endDate}
+              onStart={d => setStartDate(d)}
+              onEnd={d => setEndDate(clampEnd(d))}
+              disabled={loading}
+              maxEnd={DATASET_MAX_END}
+            />
+
+            {/* Position sizing — % of available cash per trade */}
+            <PositionSizeInput
+              value={positionSizePct}
+              onChange={setPositionSizePct}
+              disabled={loading}
+              mode={mode}
+            />
+
             {mode === 'single' ? (
               /* ── Single-stock input ── */
               <>
@@ -441,7 +525,7 @@ export default function App() {
                   />
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 11px', borderTop: `1px solid ${C.border}` }}>
                     <span style={{ fontSize: 11, color: C.muted }}>↵ send · ⇧↵ newline</span>
-                    <RunButton loading={loading} disabled={!input.trim()} onClick={run} />
+                    <RunButton loading={loading} disabled={!input.trim() || !datesValid || !positionSizeValid} onClick={run} />
                   </div>
                 </div>
                 <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -489,7 +573,7 @@ export default function App() {
                       value={strategyInput}
                       onChange={e => setStrategyInput(e.target.value)}
                       onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); run() } }}
-                      placeholder="e.g. buy when RSI < 35, sell when RSI > 65"
+                      placeholder="e.g. buy on new ATH, sell when close < 50 SMA"
                       disabled={loading}
                       rows={2}
                       style={{
@@ -500,14 +584,14 @@ export default function App() {
                     />
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                    <RunButton loading={loading} disabled={!screeningInput.trim() || !strategyInput.trim()} onClick={run} />
+                    <RunButton loading={loading} disabled={!screeningInput.trim() || !strategyInput.trim() || !datesValid || !positionSizeValid} onClick={run} />
                   </div>
                 </div>
                 <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
                   {[
-                    { screen: 'Top 1% stocks by 1-month return', strategy: 'Buy on RSI < 35, sell on RSI > 65' },
-                    { screen: 'Stocks with 3x average volume spike', strategy: 'EMA 10/30 crossover strategy' },
-                    { screen: 'Stocks breaking above their 52-week high', strategy: 'Buy breakout, sell when price drops below EMA 20' },
+                    { screen: 'Top 1% stocks by 1-month return', strategy: 'Buy when the stock reaches a new ATH. Sell when it closes below the 50-day SMA.' },
+                    { screen: 'Stocks with 3x average volume spike', strategy: 'Buy when screened. Sell when close drops below the 20-day EMA.' },
+                    { screen: 'Stocks breaking above their 52-week high', strategy: 'Buy breakout when screened. Sell when price drops below EMA 20.' },
                   ].map(({ screen, strategy }) => (
                     <button key={screen} onClick={() => { setScreeningInput(screen); setStrategyInput(strategy) }} style={{
                       background: C.card, border: `1px solid ${C.border}`, borderRadius: 8,
@@ -537,6 +621,7 @@ export default function App() {
             {[
               { id: 'dashboard', label: '📊 Dashboard' },
               { id: 'portfolio', label: '💼 Portfolio' },
+              { id: 'trades',    label: '📋 Trades' },
               { id: 'code',      label: '🧑‍💻 Strategy Code' },
               { id: 'history',   label: '🕑 History' },
               { id: 'settings',  label: '⚙️ Settings' },
@@ -554,6 +639,39 @@ export default function App() {
                 <EmptyState onSelect={setInput} />
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
+
+                  {/* Backtest period + position sizing */}
+                  {(results.period || startDate) && (
+                    <section>
+                      <Label>Backtest Period & Position Size</Label>
+                      <Card style={{ padding: '14px 18px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+                          <div>
+                            <p style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>Start</p>
+                            <p style={{ fontFamily: 'monospace', fontWeight: 700, color: C.accent, fontSize: 15 }}>
+                              {results.period?.start ?? startDate}
+                            </p>
+                          </div>
+                          <span style={{ color: C.muted, fontSize: 18 }}>→</span>
+                          <div>
+                            <p style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>End</p>
+                            <p style={{ fontFamily: 'monospace', fontWeight: 700, color: C.purple, fontSize: 15 }}>
+                              {results.period?.end ?? endDate}
+                            </p>
+                          </div>
+                          <div>
+                            <p style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>Position size</p>
+                            <p style={{ fontFamily: 'monospace', fontWeight: 700, color: C.gold, fontSize: 15 }}>
+                              {results.position_size_pct ?? positionSizePct}% cash / trade
+                            </p>
+                          </div>
+                          <p style={{ fontSize: 12, color: C.muted, marginLeft: 'auto', maxWidth: 260, lineHeight: 1.5 }}>
+                            Metrics are over this window. Each entry uses the stake % of available cash.
+                          </p>
+                        </div>
+                      </Card>
+                    </section>
+                  )}
 
                   {/* Screening Summary (screened mode only) */}
                   {results._mode === 'screened' && results.screening_summary && (
@@ -909,6 +1027,137 @@ export default function App() {
               </div>
             )}
 
+            {/* ── TRADES TAB ────────────────────────────────────────── */}
+            {activeTab === 'trades' && (() => {
+              const trades = bm.trades ?? results?.best_configuration?.metrics?.trades ?? []
+              const wins   = trades.filter(t => (+t.pnl) > 0)
+              const losses = trades.filter(t => (+t.pnl) <= 0)
+              const sumPnl = trades.reduce((s, t) => s + (+t.pnl || 0), 0)
+              const scale  = startAmount / 100_000
+
+              const downloadCsv = () => {
+                const headers = ['id','ticker','side','size','entry_date','entry_price','exit_date','exit_price','pnl','pnl_pct','commission']
+                const rows = trades.map(t => headers.map(h => {
+                  const v = t[h]
+                  return v == null ? '' : String(v).includes(',') ? `"${v}"` : v
+                }).join(','))
+                const csv  = [headers.join(','), ...rows].join('\n')
+                const blob = new Blob([csv], { type: 'text/csv' })
+                const url  = URL.createObjectURL(blob)
+                const a    = document.createElement('a')
+                a.href = url
+                a.download = `trades_${results?.strategy_id ?? 'run'}.csv`
+                a.click()
+                URL.revokeObjectURL(url)
+              }
+
+              return (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
+                  {!results ? (
+                    <div style={{ textAlign: 'center', padding: '48px 0', color: C.muted }}>
+                      <div style={{ fontSize: 48, marginBottom: 12 }}>📋</div>
+                      <p>Run a backtest to see the trade list for the best configuration.</p>
+                    </div>
+                  ) : (
+                    <>
+                      <section>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+                          <Label>Trade Summary — Best Config</Label>
+                          {trades.length > 0 && (
+                            <button
+                              onClick={downloadCsv}
+                              style={{
+                                background: C.success + '22', border: `1px solid ${C.success}55`,
+                                borderRadius: 8, padding: '5px 12px', color: C.success,
+                                fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                              }}
+                            >⬇ Download CSV</button>
+                          )}
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12 }}>
+                          <MetricCard title="Closed Trades" display={trades.length} color={C.accent} />
+                          <MetricCard title="Winners" display={wins.length} color={C.success} />
+                          <MetricCard title="Losers" display={losses.length} color={C.danger} />
+                          <MetricCard
+                            title="Sum P&L (sim)"
+                            display={`${sumPnl >= 0 ? '+' : ''}${dollar(sumPnl * scale)}`}
+                            color={sign(sumPnl)}
+                          />
+                        </div>
+                        <p style={{ fontSize: 11, color: C.muted, marginTop: 10 }}>
+                          PnL is from the $100k simulation; summary scales to your portfolio starting capital when set on Portfolio.
+                          Only closed trades from the best configuration are listed.
+                        </p>
+                      </section>
+
+                      <section>
+                        <Label>All Closed Trades ({trades.length})</Label>
+                        {trades.length === 0 ? (
+                          <Card style={{ padding: '32px 18px', textAlign: 'center', color: C.muted }}>
+                            No closed trades were recorded for this run.
+                          </Card>
+                        ) : (
+                          <Card style={{ overflow: 'hidden' }}>
+                            <div style={{ overflowX: 'auto', maxHeight: '60vh' }}>
+                              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12.5 }}>
+                                <thead>
+                                  <tr style={{ background: C.surface, position: 'sticky', top: 0 }}>
+                                    {['#', 'Ticker', 'Side', 'Size', 'Entry', 'Entry $', 'Exit', 'Exit $', 'P&L', 'P&L %', 'Comm'].map(h => (
+                                      <th key={h} style={{
+                                        padding: '10px 12px', textAlign: 'left', color: C.muted,
+                                        fontWeight: 600, fontSize: 11, textTransform: 'uppercase',
+                                        letterSpacing: '.05em', borderBottom: `1px solid ${C.border}`,
+                                        whiteSpace: 'nowrap',
+                                      }}>{h}</th>
+                                    ))}
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {trades.map((t, i) => {
+                                    const pnl = +t.pnl || 0
+                                    return (
+                                      <tr
+                                        key={t.id ?? i}
+                                        style={{ borderBottom: `1px solid ${C.border}` }}
+                                        onMouseEnter={e => e.currentTarget.style.background = C.surface}
+                                        onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                                      >
+                                        <td style={{ padding: '9px 12px', color: C.muted, fontFamily: 'monospace' }}>{t.id ?? i + 1}</td>
+                                        <td style={{ padding: '9px 12px', fontFamily: 'monospace', fontWeight: 700, color: C.accent }}>{t.ticker ?? '—'}</td>
+                                        <td style={{
+                                          padding: '9px 12px', fontFamily: 'monospace',
+                                          color: t.side === 'short' ? C.purple : C.text,
+                                          textTransform: 'uppercase', fontSize: 11,
+                                        }}>{t.side ?? 'long'}</td>
+                                        <td style={{ padding: '9px 12px', fontFamily: 'monospace', color: C.text }}>{num(t.size)}</td>
+                                        <td style={{ padding: '9px 12px', fontFamily: 'monospace', color: C.muted, whiteSpace: 'nowrap' }}>{t.entry_date ?? '—'}</td>
+                                        <td style={{ padding: '9px 12px', fontFamily: 'monospace', color: C.text }}>{t.entry_price != null ? dollar(t.entry_price) : '—'}</td>
+                                        <td style={{ padding: '9px 12px', fontFamily: 'monospace', color: C.muted, whiteSpace: 'nowrap' }}>{t.exit_date ?? '—'}</td>
+                                        <td style={{ padding: '9px 12px', fontFamily: 'monospace', color: C.text }}>{t.exit_price != null ? dollar(t.exit_price) : '—'}</td>
+                                        <td style={{ padding: '9px 12px', fontFamily: 'monospace', fontWeight: 600, color: sign(pnl) }}>
+                                          {pnl >= 0 ? '+' : ''}{dollar(pnl)}
+                                        </td>
+                                        <td style={{ padding: '9px 12px', fontFamily: 'monospace', color: sign(t.pnl_pct) }}>
+                                          {t.pnl_pct != null ? pct(t.pnl_pct) : '—'}
+                                        </td>
+                                        <td style={{ padding: '9px 12px', fontFamily: 'monospace', color: C.muted }}>
+                                          {t.commission != null ? dollar(t.commission) : '—'}
+                                        </td>
+                                      </tr>
+                                    )
+                                  })}
+                                </tbody>
+                              </table>
+                            </div>
+                          </Card>
+                        )}
+                      </section>
+                    </>
+                  )}
+                </div>
+              )
+            })()}
+
             {/* ── CODE TAB ──────────────────────────────────────────── */}
             {activeTab === 'code' && (() => {
               const codeSource  = results ?? debugData
@@ -1170,6 +1419,139 @@ function RunButton({ loading, disabled, onClick }) {
         : '▶'}
       {loading ? 'Running' : 'Run'}
     </button>
+  )
+}
+
+function DateRangePicker({ startDate, endDate, onStart, onEnd, disabled, maxEnd }) {
+  const invalid = startDate && endDate && startDate >= endDate
+  const inputStyle = {
+    width: '100%',
+    background: C.surface,
+    border: `1px solid ${invalid ? C.danger : C.border}`,
+    borderRadius: 8,
+    padding: '7px 10px',
+    color: C.text,
+    fontSize: 12,
+    fontFamily: 'monospace',
+    colorScheme: 'dark',
+  }
+  return (
+    <div style={{
+      background: C.card, border: `1px solid ${C.border}`, borderRadius: 12,
+      padding: '10px 12px', marginBottom: 8,
+    }}>
+      <p style={{
+        fontSize: 10, fontWeight: 700, color: C.gold,
+        textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 8,
+      }}>
+        Backtest Period
+      </p>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+        <div>
+          <p style={{ fontSize: 10, color: C.muted, marginBottom: 4 }}>Start</p>
+          <input
+            type="date"
+            value={startDate}
+            min="1970-01-01"
+            max={endDate || maxEnd}
+            onChange={e => onStart(e.target.value)}
+            disabled={disabled}
+            style={inputStyle}
+          />
+        </div>
+        <div>
+          <p style={{ fontSize: 10, color: C.muted, marginBottom: 4 }}>End</p>
+          <input
+            type="date"
+            value={endDate}
+            min={startDate || '1970-01-01'}
+            max={maxEnd}
+            onChange={e => onEnd(e.target.value)}
+            disabled={disabled}
+            style={inputStyle}
+          />
+        </div>
+      </div>
+      {invalid ? (
+        <p style={{ fontSize: 11, color: C.danger, marginTop: 6 }}>Start must be before end.</p>
+      ) : (
+        <p style={{ fontSize: 10, color: C.muted, marginTop: 6 }}>
+          Data available through {maxEnd}. Defaults: 2010-01-01 → {maxEnd}.
+        </p>
+      )}
+    </div>
+  )
+}
+
+function PositionSizeInput({ value, onChange, disabled, mode }) {
+  const invalid = !(value >= 1 && value <= 100)
+  const isMulti = mode === 'screened'
+  const presets = isMulti ? [5, 10, 20, 25] : [25, 50, 75, 100]
+  const inputStyle = {
+    width: 88,
+    background: C.surface,
+    border: `1px solid ${invalid ? C.danger : C.border}`,
+    borderRadius: 8,
+    padding: '7px 10px',
+    color: C.text,
+    fontSize: 13,
+    fontFamily: 'monospace',
+    fontWeight: 700,
+  }
+  return (
+    <div style={{
+      background: C.card, border: `1px solid ${C.border}`, borderRadius: 12,
+      padding: '10px 12px', marginBottom: 8,
+    }}>
+      <p style={{
+        fontSize: 10, fontWeight: 700, color: C.success,
+        textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 8,
+      }}>
+        Position Size / Trade
+      </p>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <input
+          type="number"
+          min={1}
+          max={100}
+          step={1}
+          value={value}
+          disabled={disabled}
+          onChange={e => {
+            const n = Number(e.target.value)
+            onChange(Number.isFinite(n) ? n : (isMulti ? 10 : 100))
+          }}
+          style={inputStyle}
+        />
+        <span style={{ fontSize: 13, color: C.text, fontWeight: 600 }}>%</span>
+        <span style={{ fontSize: 11, color: C.muted }}>of available cash</span>
+        <div style={{ display: 'flex', gap: 4, marginLeft: 'auto', flexWrap: 'wrap' }}>
+          {presets.map(p => (
+            <button
+              key={p}
+              type="button"
+              disabled={disabled}
+              onClick={() => onChange(p)}
+              style={{
+                background: value === p ? C.success + '33' : C.surface,
+                border: `1px solid ${value === p ? C.success : C.border}`,
+                borderRadius: 6, padding: '4px 8px',
+                color: value === p ? C.success : C.muted,
+                fontSize: 11, fontFamily: 'monospace', cursor: disabled ? 'not-allowed' : 'pointer',
+              }}
+            >{p}%</button>
+          ))}
+        </div>
+      </div>
+      {invalid ? (
+        <p style={{ fontSize: 11, color: C.danger, marginTop: 6 }}>Enter a value from 1 to 100.</p>
+      ) : (
+        <p style={{ fontSize: 10, color: C.muted, marginTop: 6 }}>
+          Default for {isMulti ? 'multi-stock' : 'single-stock'}: {isMulti ? '10%' : '100%'}.
+          Strategy code uses stake_pct and the backtest sizer.
+        </p>
+      )}
+    </div>
   )
 }
 
