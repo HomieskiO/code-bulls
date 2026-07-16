@@ -105,6 +105,7 @@ def multi_strategy_code_prompt(user_prompt: str, position_sizing: str, stake_fra
 
 Context:
 - Many data feeds; each has d._name = ticker (UPPERCASE).
+- Feeds share a master calendar (SPY). Pre-IPO / gap / delist days have volume=0 (OHLC may be 0 or ffilled) — skip trading those bars; close any open position if volume hits 0.
 - self.p.screening is dict {{"YYYY-MM-DD": ["AAPL", ...]}} with UPPERCASE tickers.
 - Only OPEN new positions for tickers in today's screening list.
 - today = self.datetime.date(0).strftime('%Y-%m-%d')
@@ -146,23 +147,44 @@ class MultiScreenStrategy(bt.Strategy):
             if len(d) <= self.p.warmup_period:
                 continue
             pos = self.getposition(d)
+            # Calendar-aligned: volume=0 means no real bar
+            try:
+                if float(d.volume[0]) <= 0:
+                    if pos.size > 0:
+                        self.close(data=d)
+                    continue
+                # require warmup live bars so indicators ignore zero-pads
+                if any(float(d.volume[-i]) <= 0 for i in range(self.p.warmup_period)):
+                    continue
+                px = float(d.close[0])
+                if px != px or px <= 0:
+                    continue
+            except Exception:
+                continue
             fast = self.inds[d._name]['fast']
             slow = self.inds[d._name]['slow']
-            fast_up = fast[0] > fast[-1]
-            slow_up = slow[0] > slow[-1]
-            fast_dn = fast[0] < fast[-1]
-            slow_dn = slow[0] < slow[-1]
+            try:
+                f0, s0 = float(fast[0]), float(slow[0])
+                f1, s1 = float(fast[-1]), float(slow[-1])
+            except Exception:
+                continue
+            if f0 != f0 or s0 != s0:
+                continue
+            fast_up = f0 > f1
+            slow_up = s0 > s1
+            fast_dn = f0 < f1
+            slow_dn = s0 < s1
             if pos.size == 0:
-                if d._name in today_screened and fast[0] > slow[0] and fast_up and slow_up:
+                if d._name in today_screened and f0 > s0 and fast_up and slow_up:
                     self.buy(data=d)
             else:
-                if fast[0] < slow[0] and fast_dn and slow_dn:
+                if f0 < s0 and fast_dn and slow_dn:
                     self.close(data=d)
             pos = self.getposition(d)
             if pos.size > 0:
-                if self.p.stop_loss is not None and d.close[0] <= pos.price * (1 - self.p.stop_loss):
+                if self.p.stop_loss is not None and px <= pos.price * (1 - self.p.stop_loss):
                     self.close(data=d)
-                elif self.p.take_profit is not None and d.close[0] >= pos.price * (1 + self.p.take_profit):
+                elif self.p.take_profit is not None and px >= pos.price * (1 + self.p.take_profit):
                     self.close(data=d)
 ```
 ```json
@@ -173,6 +195,7 @@ Rules:
 - params include screening={{}} and stake_pct={stake_frac}. JSON must NOT include screening.
 - self.buy(data=d) with NO size=. No imports, no notify_*, no comments. Close both fences.
 - try/except per feed for indicators; guard with if d._name not in self.inds.
+- Skip inactive bars: volume<=0 (calendar padding). Close open positions when volume hits 0.
 - Adapt indicators/logic to the user strategy while keeping screening gate for entries when relevant.
 
 API reference:
@@ -267,7 +290,7 @@ Performance metrics (relative to the backtest period):
 - Total Return: {total_return}%
 - Max Drawdown: {max_drawdown}%
 - Win Rate: {win_rate}%
-- Expectancy: ${expectancy} per trade
+- Expectancy: {expectancy}% expected return per trade
 - Total Trades: {total_trades}
 - Final Portfolio Value: ${final_value} (started at $100,000)
 

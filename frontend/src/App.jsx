@@ -640,12 +640,12 @@ export default function App() {
                       <MetricCard title="CAGR"           display={pct(bm.cagr)}              color={sign(bm.cagr)} />
                       <MetricCard title="Total Return"   display={pct(bm.total_return_pct)}   color={sign(bm.total_return_pct)} />
                       <MetricCard title="Max Drawdown"   display={pct(bm.max_drawdown)}       color={C.danger} />
-                      <MetricCard title="Win Rate"       display={pct(bm.win_rate)}            color={(+bm.win_rate) > 50 ? C.success : C.warning} />
-                      <MetricCard title="Expectancy"     display={dollar(bm.expectancy)}       color={sign(bm.expectancy)} />
-                      <MetricCard title="Total Trades"   display={bm.total_trades ?? 'N/A'}    color={C.accent} />
-                      <MetricCard title="Avg Win"        display={dollar(bm.avg_win)}           color={C.success} />
-                      <MetricCard title="Avg Loss"       display={dollar(bm.avg_loss)}          color={C.danger} />
                       <MetricCard title="Final Value"    display={dollar(bm.final_portfolio_value)} color={C.gold} />
+                      <MetricCard title="Expectancy"     display={pct(bm.expectancy)}          color={sign(bm.expectancy)} />
+                      <MetricCard title="Total Trades"   display={bm.total_trades ?? 'N/A'}    color={C.accent} />
+                      <MetricCard title="Avg Win"        display={pct(bm.avg_win)}             color={C.success} />
+                      <MetricCard title="Avg Loss"       display={pct(bm.avg_loss)}            color={C.danger} />
+                      <MetricCard title="Win Rate"       display={pct(bm.win_rate)}            color={(+bm.win_rate) > 50 ? C.success : C.warning} />
                     </div>
                   </section>
 
@@ -726,8 +726,14 @@ export default function App() {
                           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                             <thead>
                               <tr style={{ background: C.surface }}>
-                                {['#', 'Config', 'CAGR', 'Drawdown', 'Win Rate', 'Expectancy'].map(h => (
-                                  <th key={h} style={{ padding: '10px 16px', textAlign: 'left', color: C.muted, fontWeight: 600, fontSize: 11, textTransform: 'uppercase', letterSpacing: '.05em', borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap' }}>{h}</th>
+                                {['#', 'Config', 'CAGR', 'Drawdown', 'Avg Win', 'Avg Loss', 'Win Rate', 'Expectancy'].map(h => (
+                                  <th key={h} style={{
+                                    padding: h === 'Config' ? '10px 10px' : '10px 12px',
+                                    textAlign: 'left', color: C.muted, fontWeight: 600, fontSize: 11,
+                                    textTransform: 'uppercase', letterSpacing: '.05em',
+                                    borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap',
+                                    width: h === 'Config' ? 168 : h === '#' ? 36 : undefined,
+                                  }}>{h}</th>
                                 ))}
                               </tr>
                             </thead>
@@ -739,7 +745,7 @@ export default function App() {
                                     onMouseEnter={e => e.currentTarget.style.background = C.surface}
                                     onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
                                   >
-                                    <td style={{ padding: '10px 16px', color: C.muted, fontFamily: 'monospace' }}>{it.iteration ?? i + 1}</td>
+                                    <td style={{ padding: '10px 12px', color: C.muted, fontFamily: 'monospace' }}>{it.iteration ?? i + 1}</td>
                                     <td
                                       title={(() => {
                                         try {
@@ -750,17 +756,19 @@ export default function App() {
                                         }
                                       })()}
                                       style={{
-                                        padding: '10px 16px', fontFamily: 'monospace', fontSize: 12, color: C.accent,
-                                        maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                                        padding: '10px 10px', fontFamily: 'monospace', fontSize: 11, color: C.accent,
+                                        maxWidth: 168, width: 168, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                                         cursor: 'help',
                                       }}
                                     >
                                       {typeof it.config === 'string' ? it.config : JSON.stringify(it.config)}
                                     </td>
-                                    <td style={{ padding: '10px 16px', fontFamily: 'monospace', color: m.cagr > 0 ? C.success : C.danger }}>{pct(m.cagr)}</td>
-                                    <td style={{ padding: '10px 16px', fontFamily: 'monospace', color: C.danger }}>{pct(m.max_drawdown)}</td>
-                                    <td style={{ padding: '10px 16px', fontFamily: 'monospace', color: C.text }}>{pct(m.win_rate)}</td>
-                                    <td style={{ padding: '10px 16px', fontFamily: 'monospace', color: m.expectancy > 0 ? C.success : C.danger }}>{dollar(m.expectancy)}</td>
+                                    <td style={{ padding: '10px 12px', fontFamily: 'monospace', color: m.cagr > 0 ? C.success : C.danger }}>{pct(m.cagr)}</td>
+                                    <td style={{ padding: '10px 12px', fontFamily: 'monospace', color: C.danger }}>{pct(m.max_drawdown)}</td>
+                                    <td style={{ padding: '10px 12px', fontFamily: 'monospace', color: C.success }}>{pct(m.avg_win)}</td>
+                                    <td style={{ padding: '10px 12px', fontFamily: 'monospace', color: C.danger }}>{pct(m.avg_loss)}</td>
+                                    <td style={{ padding: '10px 12px', fontFamily: 'monospace', color: C.text }}>{pct(m.win_rate)}</td>
+                                    <td style={{ padding: '10px 12px', fontFamily: 'monospace', color: m.expectancy > 0 ? C.success : C.danger }}>{pct(m.expectancy)}</td>
                                   </tr>
                                 )
                               })}
@@ -909,21 +917,21 @@ export default function App() {
                             </p>
                           </div>
                           <div>
-                            <p style={{ fontSize: 12, color: C.muted, marginBottom: 4 }}>Expected gain per trade</p>
+                            <p style={{ fontSize: 12, color: C.muted, marginBottom: 4 }}>Expected return per trade</p>
                             <p style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: sign(bm.expectancy) }}>
-                              {dollar(bm.expectancy)}
+                              {pct(bm.expectancy)}
                             </p>
                           </div>
                           <div>
                             <p style={{ fontSize: 12, color: C.muted, marginBottom: 4 }}>Avg win per trade</p>
                             <p style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: C.success }}>
-                              {dollar(bm.avg_win)}
+                              {pct(bm.avg_win)}
                             </p>
                           </div>
                           <div>
                             <p style={{ fontSize: 12, color: C.muted, marginBottom: 4 }}>Avg loss per trade</p>
                             <p style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: C.danger }}>
-                              -{dollar(bm.avg_loss)}
+                              -{pct(bm.avg_loss)}
                             </p>
                           </div>
                         </div>
@@ -1060,7 +1068,7 @@ export default function App() {
                           <Stat label="CAGR"      value={pct(h.best_cagr)}       color={sign(h.best_cagr)} />
                           <Stat label="Drawdown"  value={pct(h.best_drawdown)}   color={C.danger} />
                           <Stat label="Win Rate"  value={pct(h.best_win_rate)}   color={C.accent} />
-                          <Stat label="Expectancy" value={dollar(h.best_expectancy)} color={sign(h.best_expectancy)} />
+                          <Stat label="Expectancy" value={pct(h.best_expectancy)} color={sign(h.best_expectancy)} />
                         </div>
                       )}
                     </Card>

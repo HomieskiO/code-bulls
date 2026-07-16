@@ -35,7 +35,10 @@ def test_period_clip_and_cagr():
         }),
         drawdown=FakeAnalyzer({"max": {"drawdown": 12.5}}),
         portfolio=FakeAnalyzer(portfolio),
-        tradelog=FakeAnalyzer([]),
+        tradelog=FakeAnalyzer([
+            {"pnl": 50.0, "pnl_pct": 10.0},
+            {"pnl": -25.0, "pnl_pct": -5.0},
+        ]),
     )
     strat = SimpleNamespace(analyzers=analyzers)
     broker = SimpleNamespace(startingcash=100000.0, getvalue=lambda: 180000.0)
@@ -48,6 +51,11 @@ def test_period_clip_and_cagr():
     assert dates[-1] <= "2017-11-10"
     assert m["total_return_pct"] == 80.0  # 180k/100k - 1 within window
     assert "trades" in m
+    # avg win/loss/expectancy reported as trade return % (not $)
+    assert m["avg_win"] == 10.0
+    assert m["avg_loss"] == 5.0
+    # E = 0.5*10 - 0.5*5 = 2.5%
+    assert m["expectancy"] == 2.5
 
 
 if __name__ == "__main__":

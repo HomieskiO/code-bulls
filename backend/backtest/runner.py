@@ -141,6 +141,20 @@ def _resolve_csv_path(ticker: str) -> Optional[str]:
     return None
 
 
+def _csv_first_date(filepath: str) -> Optional[str]:
+    """Return first YYYY-MM-DD in a Kaggle CSV, or None."""
+    try:
+        with open(filepath, "r", errors="ignore") as fh:
+            fh.readline()
+            for line in fh:
+                if not line.strip():
+                    continue
+                return line.split(",", 1)[0].strip()[:10]
+    except Exception:
+        return None
+    return None
+
+
 # Strategies often use SMA(50) / Highest(252) — need enough bars in window
 _MIN_BARS_FOR_INDICATORS = int(os.getenv("MIN_BARS_FOR_INDICATORS", "280"))
 
@@ -191,6 +205,115 @@ def _price_series_sane(
         return False
 
 
+def _ticker_eligible_for_multi(
+    ticker: str,
+    *,
+    from_dt: dt_module.datetime,
+    to_dt: dt_module.datetime,
+    allow_etf: bool = False,
+) -> Tuple[bool, str]:
+    """Whether a ticker has usable Kaggle price history in the window."""
+    if allow_etf:
+        filepath = _resolve_csv_path(ticker)
+    else:
+        filepath = os.path.join(KAGGLE_STOCKS_PATH, f"{ticker.lower()}.us.txt")
+        if not os.path.exists(filepath):
+            filepath = None
+    if not filepath or not _has_enough_data(filepath):
+        return False, "missing_or_tiny"
+    if not _csv_first_date(filepath):
+        return False, "no_dates"
+    if not _price_series_sane(filepath, from_dt, to_dt):
+        return False, "bad_or_short"
+    return True, "ok"
+
+
+def _load_ohlcv_df(
+    filepath: str,
+    from_dt: dt_module.datetime,
+    to_dt: dt_module.datetime,
+) -> Optional[pd.DataFrame]:
+    """Load Kaggle OHLCV CSV into a DatetimeIndex DataFrame (unsorted-safe)."""
+    try:
+        df = pd.read_csv(
+            filepath,
+            usecols=["Date", "Open", "High", "Low", "Close", "Volume"],
+            dtype={
+                "Open": "float64",
+                "High": "float64",
+                "Low": "float64",
+                "Close": "float64",
+                "Volume": "float64",
+            },
+        )
+        if df is None or df.empty:
+            return None
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date", "Close"])
+        df = df.set_index("Date").sort_index()
+        df = df.loc[(df.index >= pd.Timestamp(from_dt)) & (df.index <= pd.Timestamp(to_dt))]
+        if df.empty:
+            return None
+        df = df.rename(
+            columns={
+                "Open": "open",
+                "High": "high",
+                "Low": "low",
+                "Close": "close",
+                "Volume": "volume",
+            }
+        )
+        return df[["open", "high", "low", "close", "volume"]]
+    except Exception as ex:
+        print(f"  WARNING: could not parse {filepath}: {ex}")
+        return None
+
+
+def _align_to_calendar(
+    df: pd.DataFrame,
+    calendar: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    """
+    Reindex a stock onto the master session calendar.
+
+    Backtrader multi-data only calls strategy.next() once every feed has a first
+    bar, so late IPOs would otherwise delay the whole run. Aligning onto the
+    clock calendar gives every feed the same start/end.
+
+    Inactive days (pre-IPO / gaps / post-delist):
+      - volume = 0  (strategy must skip these; also used to force-exit)
+      - OHLC = 0 before first print (never NaN — NaN poisons broker.getvalue)
+      - OHLC ffilled after first print so open positions can be marked/closed
+    """
+    aligned = df.reindex(calendar)
+    had_bar = aligned["close"].notna()
+    aligned["volume"] = aligned["volume"].where(had_bar, 0.0).fillna(0.0)
+    ohlc = ["open", "high", "low", "close"]
+    # Carry last print forward (delist / gaps); zeros only before first print
+    aligned[ohlc] = aligned[ohlc].ffill().fillna(0.0)
+    return aligned
+
+
+def _make_pandas_feed(
+    df: pd.DataFrame,
+    name: str,
+    from_dt: dt_module.datetime,
+    to_dt: dt_module.datetime,
+) -> bt.feeds.PandasData:
+    return bt.feeds.PandasData(
+        dataname=df,
+        name=name,
+        open="open",
+        high="high",
+        low="low",
+        close="close",
+        volume="volume",
+        openinterest=-1,
+        fromdate=from_dt,
+        todate=to_dt,
+    )
+
+
 def _make_csv_feed(
     ticker: str,
     from_dt: dt_module.datetime,
@@ -198,11 +321,12 @@ def _make_csv_feed(
     *,
     name: Optional[str] = None,
     allow_etf: bool = False,
-) -> Optional[bt.feeds.GenericCSVData]:
-    """Load one Kaggle CSV feed, or None if missing/unsuitable.
+    calendar: Optional[pd.DatetimeIndex] = None,
+) -> Optional[bt.feeds.PandasData]:
+    """Load one Kaggle feed as PandasData, optionally calendar-aligned.
 
     ``allow_etf=True`` also searches ETFs/ (needed for SPY clock).
-    Screened equities stay Stocks/-only via allow_etf=False.
+    When ``calendar`` is provided, the series is reindexed to it (pad volume=0).
     """
     if allow_etf:
         filepath = _resolve_csv_path(ticker)
@@ -214,23 +338,14 @@ def _make_csv_feed(
         return None
     if not _price_series_sane(filepath, from_dt, to_dt):
         return None
+    df = _load_ohlcv_df(filepath, from_dt, to_dt)
+    if df is None or df.empty:
+        return None
+    if calendar is not None:
+        df = _align_to_calendar(df, calendar)
     feed_name = name or ticker
     try:
-        return bt.feeds.GenericCSVData(
-            dataname=filepath,
-            name=feed_name,
-            dtformat=_fast_date_parse,
-            date=0,
-            open=1,
-            high=2,
-            low=3,
-            close=4,
-            volume=5,
-            openinterest=6,
-            fromdate=from_dt,
-            todate=to_dt,
-            preload=True,
-        )
+        return _make_pandas_feed(df, feed_name, from_dt, to_dt)
     except Exception as ex:
         print(f"  WARNING: could not load {ticker}: {ex}")
         return None
@@ -292,6 +407,35 @@ def run_multi_backtest_core(
 
     print(f"  Pre-cap {screening_date_coverage(screening_dict)}")
 
+    # Drop unusable series (missing / corrupt / too short) before the universe cap.
+    # Late IPOs are KEPT — they are calendar-aligned onto the clock so they do not
+    # delay strategy.next() (backtrader otherwise waits for every feed's first bar).
+    raw_unique = {t for ts in screening_dict.values() for t in ts}
+    eligible: set = set()
+    skip_reasons: Dict[str, int] = {}
+    for t in raw_unique:
+        ok, reason = _ticker_eligible_for_multi(t, from_dt=from_dt, to_dt=to_dt)
+        if ok:
+            eligible.add(t)
+        else:
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+    if not eligible:
+        raise ValueError(
+            "No screened tickers have usable price history in the requested window."
+        )
+    n_dropped = len(raw_unique) - len(eligible)
+    if n_dropped:
+        print(
+            f"  Pre-cap eligibility: keep={len(eligible)}/{len(raw_unique)} "
+            f"(dropped={n_dropped}, reasons={skip_reasons})"
+        )
+    screening_dict = {
+        d: [t for t in ts if t in eligible]
+        for d, ts in screening_dict.items()
+    }
+    screening_dict = {d: ts for d, ts in screening_dict.items() if ts}
+    print(f"  Post-eligibility {screening_date_coverage(screening_dict)}")
+
     # Time-balanced universe cap (per-year top names) — avoids 2017-only bias
     n_unique = len({t for ts in screening_dict.values() for t in ts})
     if n_unique > max_unique_tickers:
@@ -318,39 +462,50 @@ def run_multi_backtest_core(
     feeds: List[Tuple[Any, str]] = []
     skipped_invalid = skipped_bad = 0
 
-    # --- Master clock (data0): SPY (ETF) preferred for full session calendar ---
-    # Backtrader advances strategy.next() on data0's dates. Without a long
-    # liquid clock, a short-lived "top mover" as data0 confines the run to 2017.
+    # --- Master clock (data0): SPY preferred; its session calendar is the align target ---
+    # Backtrader multi-data starts next() only when every feed has a first bar.
+    # Aligning every equity onto the clock calendar (NaN OHLC + volume=0 pre-IPO)
+    # keeps the timeline at the clock start while still trading late listings later.
     clock_ticker = None
+    calendar: Optional[pd.DatetimeIndex] = None
     for cand in CLOCK_CANDIDATES:
-        feed = _make_csv_feed(cand, from_dt, to_dt, allow_etf=True)
-        if feed is not None:
-            clock_ticker = cand
-            feeds.append((feed, cand))
-            print(
-                f"  Clock feed (data0): {cand} "
-                f"file_range={_peek_csv_date_range(cand)} "
-                f"fromdate={from_dt.date()} todate={to_dt.date()}"
-            )
-            break
-    if clock_ticker is None:
+        clock_path = _resolve_csv_path(cand)
+        if not clock_path or not _has_enough_data(clock_path):
+            continue
+        clock_df = _load_ohlcv_df(clock_path, from_dt, to_dt)
+        if clock_df is None or clock_df.empty:
+            continue
+        calendar = clock_df.index
+        clock_ticker = cand
+        feeds.append((_make_pandas_feed(clock_df, cand, from_dt, to_dt), cand))
+        print(
+            f"  Clock feed (data0): {cand} "
+            f"file_range={_peek_csv_date_range(cand)} "
+            f"bars={len(calendar)} "
+            f"fromdate={from_dt.date()} todate={to_dt.date()} "
+            f"(equities calendar-aligned; volume=0 before first print)"
+        )
+        break
+    if clock_ticker is None or calendar is None:
         print(
             "  WARNING: no preferred clock feed found (tried SPY first); "
             "using first screened ticker as data0 (may truncate timeline)"
         )
 
-    # Remaining screened names (skip clock if already added)
+    # Remaining screened names, reindexed onto the clock calendar
     for ticker in all_tickers:
         if ticker == clock_ticker:
             continue
-        filepath = os.path.join(KAGGLE_STOCKS_PATH, f"{ticker.lower()}.us.txt")
-        if not os.path.exists(filepath) or not _has_enough_data(filepath):
-            skipped_invalid += 1
+        ok, reason = _ticker_eligible_for_multi(ticker, from_dt=from_dt, to_dt=to_dt)
+        if not ok:
+            if reason == "bad_or_short":
+                skipped_bad += 1
+            else:
+                skipped_invalid += 1
             continue
-        if not _price_series_sane(filepath, from_dt, to_dt):
-            skipped_bad += 1
-            continue
-        feed = _make_csv_feed(ticker, from_dt, to_dt)
+        feed = _make_csv_feed(
+            ticker, from_dt, to_dt, calendar=calendar if calendar is not None else None
+        )
         if feed is None:
             skipped_invalid += 1
             continue
@@ -363,10 +518,19 @@ def run_multi_backtest_core(
             f"  Clock feed (data0) fallback: {feeds[0][1]} "
             f"file_range={_peek_csv_date_range(feeds[0][1])}"
         )
+
+    loaded_names = {name for _, name in feeds}
+    screening_dict = {
+        d: [t for t in ts if t in loaded_names]
+        for d, ts in screening_dict.items()
+    }
+    screening_dict = {d: ts for d, ts in screening_dict.items() if ts}
+
     print(
         f"  Loaded {len(feeds)} feeds "
         f"(clock={clock_ticker or feeds[0][1]}, "
-        f"{skipped_invalid} insufficient, {skipped_bad} bad prices skipped)."
+        f"{skipped_invalid} insufficient, {skipped_bad} bad/short skipped; "
+        f"calendar-aligned={calendar is not None})."
     )
 
     StrategyClass = load_strategy_class(strategy_code)

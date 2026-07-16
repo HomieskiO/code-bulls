@@ -1,0 +1,7 @@
+{
+  "fast": 15,
+  "slow": 50,
+  "stake_pct": 1.0,
+  "stop_loss": null,
+  "take_profit": null
+}

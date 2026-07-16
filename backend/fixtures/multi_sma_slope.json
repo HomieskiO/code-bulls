@@ -1,0 +1,8 @@
+{
+  "sma_fast": 10,
+  "sma_slow": 20,
+  "warmup_period": 30,
+  "stake_pct": 0.1,
+  "stop_loss": 0.05,
+  "take_profit": 0.5
+}

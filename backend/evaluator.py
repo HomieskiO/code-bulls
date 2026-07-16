@@ -132,14 +132,17 @@ class TradeLogAnalyzer(bt.Analyzer):
     One row per closed trade for the frontend Trades tab.
 
     Notes:
-    - On close, ``trade.size`` is 0 in backtrader — size must be captured while open.
-    - Prefer trade.history when tradehistory=True for entry/exit prices.
+    - Backtrader notifies with ``copy.copy(trade)``, so ``id(trade)`` is NOT stable
+      across open/close (and IDs get reused after GC). Always key by ``trade.ref``.
+    - On close, ``trade.size`` is 0 — capture size while open and/or from history.
+    - ``trade.history`` entries nest fields under ``.status`` and ``.event``
+      (TradeHistory AutoOrderedDict); never read top-level ``.size``/``.price``.
     """
 
     def start(self):
         self._trades = []
-        self._open   = {}   # id(trade) -> open snapshot
-        self._seq    = 0
+        self._open = {}  # trade.ref -> open snapshot
+        self._seq = 0
 
     def _ticker(self, trade) -> str:
         data = trade.data
@@ -157,26 +160,79 @@ class TradeLogAnalyzer(bt.Analyzer):
         except Exception:
             return None
 
+    @staticmethod
+    def _hist_event_size(ev) -> float:
+        """Absolute fill size from a TradeHistory entry."""
+        try:
+            event = ev.event if hasattr(ev, "event") else None
+            if event is not None and "size" in event:
+                return abs(float(event["size"] or 0.0))
+        except Exception:
+            pass
+        try:
+            status = ev.status if hasattr(ev, "status") else None
+            if status is not None and "size" in status:
+                return abs(float(status["size"] or 0.0))
+        except Exception:
+            pass
+        return 0.0
+
+    @staticmethod
+    def _hist_event_price(ev) -> float:
+        """Fill price from a TradeHistory entry (prefer event/fill price)."""
+        try:
+            event = ev.event if hasattr(ev, "event") else None
+            if event is not None and "price" in event:
+                p = float(event["price"] or 0.0)
+                if p:
+                    return p
+        except Exception:
+            pass
+        try:
+            status = ev.status if hasattr(ev, "status") else None
+            if status is not None and "price" in status:
+                return float(status["price"] or 0.0)
+        except Exception:
+            pass
+        return 0.0
+
+    @staticmethod
+    def _hist_event_dt(ev):
+        try:
+            status = ev.status if hasattr(ev, "status") else None
+            raw = status.get("dt") if status is not None and hasattr(status, "get") else None
+            if raw is None and status is not None:
+                raw = status["dt"] if "dt" in status else None
+            if raw is None:
+                return None
+            return bt.num2date(raw).date().isoformat()
+        except Exception:
+            return None
+
     def notify_trade(self, trade):
         data = trade.data
         if data is None:
             return
 
-        key = id(trade)
+        # trade.ref survives copy.copy(); id(trade) does not
+        key = getattr(trade, "ref", None)
+        if key is None:
+            key = id(trade)
+
         now = self._bar_dt(trade)
         ticker = self._ticker(trade)
 
         # Capture / refresh open snapshot while the trade has a non-zero size
         size_now = abs(float(trade.size or 0.0))
-        if trade.isopen and size_now > 0:
+        if (trade.isopen or getattr(trade, "justopened", False)) and size_now > 0:
             if key not in self._open:
                 self._seq += 1
                 self._open[key] = {
-                    "id":          self._seq,
-                    "ticker":      ticker,
-                    "side":        "long" if float(trade.size or 0) >= 0 else "short",
-                    "size":        size_now,
-                    "entry_date":  now.date().isoformat() if now else None,
+                    "id": self._seq,
+                    "ticker": ticker,
+                    "side": "long" if float(trade.size or 0) >= 0 else "short",
+                    "size": size_now,
+                    "entry_date": now.date().isoformat() if now else None,
                     "entry_price": round(float(trade.price or 0.0), 4),
                 }
             else:
@@ -190,43 +246,26 @@ class TradeLogAnalyzer(bt.Analyzer):
 
         opened = self._open.pop(key, None)
 
-        # Prefer history events when available (tradehistory=True)
         entry_date = opened["entry_date"] if opened else None
         entry_price = opened["entry_price"] if opened else None
         size = opened["size"] if opened else 0.0
-        side = opened["side"] if opened else "long"
+        side = opened["side"] if opened else ("long" if getattr(trade, "long", True) else "short")
         trade_id = opened["id"] if opened else None
         exit_price = None
 
         hist = getattr(trade, "history", None) or []
         if hist:
             try:
-                # history events: each has status, event, size, price, ...
                 first = hist[0]
                 last = hist[-1]
-                # event objects vary by bt version — use duck typing
-                def _ev_price(ev):
-                    return float(getattr(ev, "price", None) or getattr(getattr(ev, "event", None), "price", 0) or 0)
-
-                def _ev_size(ev):
-                    return abs(float(getattr(ev, "size", None) or getattr(getattr(ev, "event", None), "size", 0) or 0))
-
-                def _ev_dt(ev):
-                    raw = getattr(ev, "datetime", None) or getattr(getattr(ev, "event", None), "datetime", None)
-                    if raw is None:
-                        return None
-                    try:
-                        return bt.num2date(raw).date().isoformat()
-                    except Exception:
-                        return str(raw)[:10]
-
                 if not entry_price:
-                    entry_price = _ev_price(first) or None
+                    entry_price = self._hist_event_price(first) or None
                 if not size:
-                    size = max((_ev_size(ev) for ev in hist), default=0.0)
+                    size = max((self._hist_event_size(ev) for ev in hist), default=0.0)
                 if not entry_date:
-                    entry_date = _ev_dt(first)
-                exit_price = _ev_price(last) or None
+                    entry_date = self._hist_event_dt(first)
+                # Exit = last fill price (close event)
+                exit_price = self._hist_event_price(last) or None
             except Exception:
                 pass
 
@@ -240,9 +279,10 @@ class TradeLogAnalyzer(bt.Analyzer):
         size = float(size or 0.0)
 
         pnl = float(trade.pnlcomm or 0.0)
+        gross = float(trade.pnl or 0.0)
+
         if exit_price is None and size > 0 and entry_price:
             try:
-                gross = float(trade.pnl or 0.0)
                 if side == "short":
                     exit_price = entry_price - (gross / size)
                 else:
@@ -250,8 +290,14 @@ class TradeLogAnalyzer(bt.Analyzer):
             except Exception:
                 exit_price = None
 
+        # Last-resort size from gross PnL and price move
+        if size <= 0 and entry_price and exit_price and abs(float(exit_price) - entry_price) > 1e-12:
+            try:
+                size = abs(gross / (float(exit_price) - entry_price))
+            except Exception:
+                pass
+
         exit_date = now.date().isoformat() if now else None
-        # Fall back to dtclose ordinal
         if exit_date is None and getattr(trade, "dtclose", None):
             try:
                 exit_date = bt.num2date(trade.dtclose).date().isoformat()
@@ -263,21 +309,19 @@ class TradeLogAnalyzer(bt.Analyzer):
             except Exception:
                 pass
 
+        notional = entry_price * size if entry_price and size else 0.0
         self._trades.append({
-            "id":          trade_id,
-            "ticker":      ticker if not opened else opened["ticker"],
-            "side":        side,
-            "size":        round(size, 4),
-            "entry_date":  entry_date,
+            "id": trade_id,
+            "ticker": opened["ticker"] if opened else ticker,
+            "side": side,
+            "size": round(size, 4),
+            "entry_date": entry_date,
             "entry_price": round(entry_price, 4) if entry_price else None,
-            "exit_date":   exit_date,
-            "exit_price":  round(exit_price, 4) if exit_price is not None else None,
-            "pnl":         round(pnl, 2),
-            "pnl_pct":     round(
-                (pnl / (entry_price * size) * 100) if entry_price and size else 0.0,
-                2,
-            ),
-            "commission":  round(float(trade.commission or 0.0), 2),
+            "exit_date": exit_date,
+            "exit_price": round(float(exit_price), 4) if exit_price is not None else None,
+            "pnl": round(pnl, 2),
+            "pnl_pct": round((pnl / notional * 100) if notional else 0.0, 2),
+            "commission": round(float(trade.commission or 0.0), 2),
         })
 
     def get_analysis(self):
@@ -402,13 +446,38 @@ def get_metrics(cerebro, results, period_start: str = None, period_end: str = No
                 )
                 total_return = round((final_value / initial_cash - 1) * 100, 4)
 
+    # Avg win / loss as mean trade return % (not $) — matches per-trade P&L %
+    win_pcts = [
+        float(t["pnl_pct"])
+        for t in trades
+        if (t.get("pnl") or 0) > 0 and t.get("pnl_pct") is not None
+    ]
+    loss_pcts = [
+        abs(float(t["pnl_pct"]))
+        for t in trades
+        if (t.get("pnl") or 0) <= 0 and t.get("pnl_pct") is not None
+    ]
+    avg_win_pct = round(float(np.mean(win_pcts)), 2) if win_pcts else 0.0
+    avg_loss_pct = round(float(np.mean(loss_pcts)), 2) if loss_pcts else 0.0
+    # Expectancy in %: E[return%] = P(win)*avg_win% - P(loss)*avg_loss%
+    n_closed = len(trades)
+    if n_closed > 0:
+        p_win = len(win_pcts) / n_closed
+        p_loss = len(loss_pcts) / n_closed
+        expectancy_pct = round(p_win * avg_win_pct - p_loss * avg_loss_pct, 2)
+    else:
+        # Fall back to analyzer $ values only if trade log empty (legacy)
+        avg_win_pct = exp_data.get("avg_win", 0.0)
+        avg_loss_pct = exp_data.get("avg_loss", 0.0)
+        expectancy_pct = exp_data.get("expectancy", 0.0)
+
     return {
         "cagr":                  cagr,
         "max_drawdown":          round(max_dd, 4),
         "win_rate":              exp_data.get("win_rate",   0.0),
-        "avg_win":               exp_data.get("avg_win",    0.0),
-        "avg_loss":              exp_data.get("avg_loss",   0.0),
-        "expectancy":            exp_data.get("expectancy", 0.0),
+        "avg_win":               avg_win_pct,       # % return on winning trades
+        "avg_loss":              avg_loss_pct,      # % return magnitude on losing trades
+        "expectancy":            expectancy_pct,    # expected % return per trade
         "total_trades":          exp_data.get("total_trades", 0) or len(trades),
         "final_portfolio_value": round(final_value, 2),
         "total_return_pct":      total_return,
