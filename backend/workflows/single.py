@@ -17,6 +17,7 @@ from codegen.extract import (
     position_sizing_instructions,
     validate_python_syntax,
 )
+from fixtures import fixtures_enabled, load_single_fixture
 from llm import call_llm, is_ready, not_ready_message
 from prompts import optimize_prompt, repair_strategy_prompt, strategy_code_prompt
 
@@ -26,6 +27,7 @@ class GraphState(TypedDict):
     start_date: str
     end_date: str
     position_size_pct: float
+    use_fixtures: bool
     generated_code: str
     current_iteration_number: int
     current_config: dict
@@ -36,10 +38,25 @@ class GraphState(TypedDict):
 
 def _generate(state: GraphState) -> GraphState:
     print("--- Node: generate_strategy_code ---")
-    if not is_ready():
-        return {**state, "error": not_ready_message()}
     try:
         pct = position_size_pct(state, 100.0)
+        if fixtures_enabled(bool(state.get("use_fixtures"))):
+            print("  [fixtures] Loading pregenerated single-stock EMA crossover strategy")
+            code, config = load_single_fixture(pct)
+            print(f"  Fixture strategy ({len(code)} chars), config={config}")
+            return {
+                **state,
+                "generated_code": code,
+                "current_config": config,
+                "current_iteration_number": 1,
+                "all_iteration_results": [],
+                "best_config_so_far": {},
+                "error": None,
+            }
+
+        if not is_ready():
+            return {**state, "error": not_ready_message()}
+
         stake_frac = round(pct / 100.0, 4)
         sizing = position_sizing_instructions(pct)
         prompt = strategy_code_prompt(state["strategy_prompt"], sizing, stake_frac)
@@ -117,6 +134,9 @@ def _run(state: GraphState) -> GraphState:
 def _optimize(state: GraphState) -> GraphState:
     iteration = state["current_iteration_number"]
     print(f"--- Node: optimize_strategy  (was iteration {iteration}) ---")
+    if fixtures_enabled(bool(state.get("use_fixtures"))):
+        print("  [fixtures] Skipping optimize (single iteration only)")
+        return {**state, "current_iteration_number": 3}  # force END after next check
     if not is_ready():
         return {**state, "error": not_ready_message()}
     prev = state["all_iteration_results"][-1]
@@ -167,6 +187,9 @@ def _after_gen(state: GraphState) -> str:
 
 def _after_run(state: GraphState) -> str:
     if state.get("error"):
+        return END
+    if fixtures_enabled(bool(state.get("use_fixtures"))):
+        print("  [fixtures] Done after 1 backtest iteration")
         return END
     if state["current_iteration_number"] >= 3:
         return END

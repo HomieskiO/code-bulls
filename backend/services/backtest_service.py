@@ -10,6 +10,7 @@ import yfinance as yf
 from sqlalchemy.orm import Session
 
 from database import BacktestIteration, Strategy
+from fixtures import fixture_explanation, fixtures_enabled
 from graph import multi_app, app as single_app, _call_gemini
 from prompts import explain_prompt
 
@@ -141,12 +142,15 @@ def run_single(
     end_date: str,
     position_size_pct: float,
     benchmark_ticker: str = "SPY",
+    use_fixtures: bool = False,
 ) -> Dict[str, Any]:
+    use_fx = fixtures_enabled(use_fixtures)
     inputs = {
         "strategy_prompt": prompt,
         "start_date": start_date,
         "end_date": end_date,
         "position_size_pct": position_size_pct,
+        "use_fixtures": use_fx,
     }
     final_state = single_app.invoke(inputs)
     if final_state.get("error"):
@@ -155,11 +159,15 @@ def run_single(
             "generated_code": final_state.get("generated_code", ""),
             "period": {"start": start_date, "end": end_date},
             "position_size_pct": position_size_pct,
+            "used_fixtures": use_fx,
         }
 
     best = final_state["best_config_so_far"]
     m = best.get("metrics", {})
-    explanation = _explain(prompt, start_date, end_date, best)
+    if use_fx:
+        explanation = fixture_explanation("single-stock")
+    else:
+        explanation = _explain(prompt, start_date, end_date, best)
     rec = persist_run(
         db,
         user_prompt=prompt,
@@ -184,6 +192,7 @@ def run_single(
         "benchmark_values": fetch_benchmark(benchmark_ticker, bm_start, bm_end),
         "period": {"start": start_date, "end": end_date},
         "position_size_pct": position_size_pct,
+        "used_fixtures": use_fx,
     }
 
 
@@ -196,13 +205,16 @@ def run_screened(
     end_date: str,
     position_size_pct: float,
     benchmark_ticker: str = "SPY",
+    use_fixtures: bool = False,
 ) -> Dict[str, Any]:
+    use_fx = fixtures_enabled(use_fixtures)
     inputs = {
         "strategy_prompt": strategy_prompt,
         "screening_prompt": screening_prompt,
         "start_date": start_date,
         "end_date": end_date,
         "position_size_pct": position_size_pct,
+        "use_fixtures": use_fx,
     }
     final_state = multi_app.invoke(inputs)
     if final_state.get("error"):
@@ -212,12 +224,16 @@ def run_screened(
             "screening_code": final_state.get("screening_code", ""),
             "period": {"start": start_date, "end": end_date},
             "position_size_pct": position_size_pct,
+            "used_fixtures": use_fx,
         }
 
     best = final_state["best_config_so_far"]
     m = best.get("metrics", {})
     prompt = f"[Screening] {screening_prompt}\n[Strategy] {strategy_prompt}"
-    explanation = _explain(prompt, start_date, end_date, best)
+    if use_fx:
+        explanation = fixture_explanation("multi-stock")
+    else:
+        explanation = _explain(prompt, start_date, end_date, best)
     rec = persist_run(
         db,
         user_prompt=f"[SCREENED] {screening_prompt} | {strategy_prompt}",
@@ -247,6 +263,7 @@ def run_screened(
         "benchmark_values": fetch_benchmark(benchmark_ticker, bm_start, bm_end),
         "period": {"start": start_date, "end": end_date},
         "position_size_pct": position_size_pct,
+        "used_fixtures": use_fx,
         "screening_summary": {
             "unique_tickers": unique_tickers,
             "total_ticker_days": sum(len(v) for v in screening_dict.values()),

@@ -34,6 +34,8 @@ export default function App() {
   const [benchmarkTicker,  setBenchmarkTicker]  = useState('SPY')
   const [benchmarkInput,   setBenchmarkInput]   = useState('SPY')
   const [debugData,        setDebugData]        = useState(null)   // partial data on failed runs
+  // Offline pipeline test: skip LLM, use backend fixtures for default strategies
+  const [useFixtures,      setUseFixtures]      = useState(false)
   const chatEnd = useRef(null)
 
   const clampEnd = (d) => (d && d > DATASET_MAX_END ? DATASET_MAX_END : d)
@@ -113,6 +115,7 @@ export default function App() {
             end_date:           periodEnd,
             benchmark_ticker:   benchmarkTicker,
             position_size_pct:  stakePct,
+            use_fixtures:       useFixtures,
           })
         if (!res.ok || data.error) {
           if (data.generated_code || data.screening_code) {
@@ -171,6 +174,7 @@ export default function App() {
             end_date: periodEnd,
             benchmark_ticker: benchmarkTicker,
             position_size_pct: stakePct,
+            use_fixtures: useFixtures,
           })
         if (!res.ok || data.error) {
           if (data.generated_code) {
@@ -308,16 +312,29 @@ export default function App() {
         <div style={{
           width: 340, display: 'flex', flexDirection: 'column',
           borderRight: `1px solid ${C.border}`, background: C.surface, flexShrink: 0,
+          minHeight: 0, height: '100%',
         }}>
-          <div style={{ flex: 1, overflowY: 'auto', padding: '14px 10px' }}>
+          {/* Chat history — takes remaining space, always scrollable */}
+          <div style={{
+            flex: '1 1 0', minHeight: 120, overflowY: 'auto', padding: '14px 10px',
+          }}>
             {messages.map((m, i) => <Msg key={i} m={m} />)}
             <div ref={chatEnd} />
           </div>
 
-          <div style={{ padding: 10, borderTop: `1px solid ${C.border}`, background: C.bg }}>
+          {/* Inputs — capped height, scroll when crowded so chat stays visible */}
+          <div style={{
+            flex: '0 1 auto',
+            maxHeight: '48%',
+            minHeight: 0,
+            overflowY: 'auto',
+            padding: '8px 10px 10px',
+            borderTop: `1px solid ${C.border}`,
+            background: C.bg,
+          }}>
 
             {/* Mode switcher */}
-            <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
+            <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
               {[
                 { id: 'single',   label: 'Single Stock' },
                 { id: 'screened', label: 'Screened Multi-Stock' },
@@ -326,8 +343,8 @@ export default function App() {
                   key={m.id}
                   onClick={() => setMode(m.id)}
                   style={{
-                    flex: 1, padding: '6px 0', border: 'none', borderRadius: 8,
-                    fontFamily: 'inherit', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                    flex: 1, padding: '5px 0', border: 'none', borderRadius: 8,
+                    fontFamily: 'inherit', fontSize: 11, fontWeight: 600, cursor: 'pointer',
                     background: mode === m.id ? C.accent + '33' : C.card,
                     color: mode === m.id ? C.accent : C.muted,
                     borderBottom: mode === m.id ? `2px solid ${C.accent}` : `2px solid ${C.border}`,
@@ -354,6 +371,31 @@ export default function App() {
               disabled={loading}
               mode={mode}
             />
+
+            {/* Offline test mode — compact */}
+            <label
+              htmlFor="use-fixtures"
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                marginBottom: 6, padding: '4px 8px',
+                background: useFixtures ? C.warning + '18' : 'transparent',
+                border: `1px solid ${useFixtures ? C.warning + '55' : 'transparent'}`,
+                borderRadius: 6, cursor: loading ? 'default' : 'pointer',
+              }}
+            >
+              <input
+                id="use-fixtures"
+                type="checkbox"
+                checked={useFixtures}
+                disabled={loading}
+                onChange={e => setUseFixtures(e.target.checked)}
+                style={{ width: 13, height: 13, accentColor: C.warning, cursor: 'pointer', flexShrink: 0 }}
+              />
+              <span style={{ fontSize: 11, fontWeight: 600, color: useFixtures ? C.warning : C.muted }}>
+                Fixture mode
+              </span>
+              <span style={{ fontSize: 10, color: C.muted }}>· no LLM</span>
+            </label>
 
             {mode === 'single' ? (
               /* ── Single-stock input ── */
@@ -698,7 +740,23 @@ export default function App() {
                                     onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
                                   >
                                     <td style={{ padding: '10px 16px', color: C.muted, fontFamily: 'monospace' }}>{it.iteration ?? i + 1}</td>
-                                    <td style={{ padding: '10px 16px', fontFamily: 'monospace', fontSize: 12, color: C.accent, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{typeof it.config === 'string' ? it.config : JSON.stringify(it.config)}</td>
+                                    <td
+                                      title={(() => {
+                                        try {
+                                          const c = typeof it.config === 'string' ? JSON.parse(it.config) : it.config
+                                          return JSON.stringify(c, null, 2)
+                                        } catch {
+                                          return typeof it.config === 'string' ? it.config : JSON.stringify(it.config, null, 2)
+                                        }
+                                      })()}
+                                      style={{
+                                        padding: '10px 16px', fontFamily: 'monospace', fontSize: 12, color: C.accent,
+                                        maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                                        cursor: 'help',
+                                      }}
+                                    >
+                                      {typeof it.config === 'string' ? it.config : JSON.stringify(it.config)}
+                                    </td>
                                     <td style={{ padding: '10px 16px', fontFamily: 'monospace', color: m.cagr > 0 ? C.success : C.danger }}>{pct(m.cagr)}</td>
                                     <td style={{ padding: '10px 16px', fontFamily: 'monospace', color: C.danger }}>{pct(m.max_drawdown)}</td>
                                     <td style={{ padding: '10px 16px', fontFamily: 'monospace', color: C.text }}>{pct(m.win_rate)}</td>

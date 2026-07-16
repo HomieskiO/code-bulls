@@ -66,6 +66,8 @@ class BacktestRequest(BaseModel):
     end_date: str = DEFAULT_END
     benchmark_ticker: str = "SPY"
     position_size_pct: float = 100.0
+    # Skip LLM: use pregenerated strategy for offline/full-pipeline testing
+    use_fixtures: bool = False
 
 
 class ScreenedBacktestRequest(BaseModel):
@@ -75,6 +77,7 @@ class ScreenedBacktestRequest(BaseModel):
     end_date: str = DEFAULT_END
     benchmark_ticker: str = "SPY"
     position_size_pct: float = 10.0
+    use_fixtures: bool = False
 
 
 @app.post("/api/backtest")
@@ -88,6 +91,7 @@ def run_backtest_endpoint(request: BacktestRequest, db: Session = Depends(get_db
         end_date=end_date,
         position_size_pct=position_size_pct,
         benchmark_ticker=request.benchmark_ticker,
+        use_fixtures=request.use_fixtures,
     )
 
 
@@ -105,6 +109,7 @@ def run_screened_backtest(
         end_date=end_date,
         position_size_pct=position_size_pct,
         benchmark_ticker=request.benchmark_ticker,
+        use_fixtures=request.use_fixtures,
     )
 
 

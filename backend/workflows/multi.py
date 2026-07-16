@@ -18,10 +18,19 @@ from codegen.extract import (
     position_sizing_instructions,
     validate_python_syntax,
 )
+from fixtures import (
+    fixtures_enabled,
+    load_multi_fixture,
+    load_screening_params_fixture,
+)
 from llm import call_llm, is_ready, not_ready_message
 from prompts import multi_strategy_code_prompt, optimize_prompt, repair_strategy_prompt
 from screening.engine import MAX_UNIQUE_TICKERS, run_fixed_screener
-from screening.params import SCREENING_PARAMS_PROMPT, parse_screening_params_from_llm
+from screening.params import (
+    SCREENING_PARAMS_PROMPT,
+    infer_screening_params,
+    parse_screening_params_from_llm,
+)
 
 
 class ScreenGraphState(TypedDict):
@@ -30,6 +39,7 @@ class ScreenGraphState(TypedDict):
     start_date: str
     end_date: str
     position_size_pct: float
+    use_fixtures: bool
     generated_code: str
     screening_code: str
     screening_params: dict
@@ -43,9 +53,24 @@ class ScreenGraphState(TypedDict):
 
 def _gen_screening(state: ScreenGraphState) -> ScreenGraphState:
     print("--- Node: generate_screening_params ---")
-    if not is_ready():
-        return {**state, "error": not_ready_message()}
     try:
+        if fixtures_enabled(bool(state.get("use_fixtures"))):
+            # Prefer fixture defaults; still allow heuristic from prompt text
+            params = load_screening_params_fixture()
+            heur = infer_screening_params(state.get("screening_prompt") or "")
+            # Keep fixture defaults unless user clearly changed prompt intent
+            params = {**params, **{k: heur[k] for k in ("lookback_days", "top_pct", "metric") if k in heur}}
+            print(f"  [fixtures] Screening params: {params}")
+            return {
+                **state,
+                "screening_params": params,
+                "screening_code": "",
+                "error": None,
+            }
+
+        if not is_ready():
+            return {**state, "error": not_ready_message()}
+
         prompt = SCREENING_PARAMS_PROMPT.format(prompt=state["screening_prompt"])
         text = call_llm(prompt)
         params = parse_screening_params_from_llm(text, state["screening_prompt"])
@@ -94,10 +119,25 @@ def _run_screening(state: ScreenGraphState) -> ScreenGraphState:
 
 def _gen_strategy(state: ScreenGraphState) -> ScreenGraphState:
     print("--- Node: generate_multi_strategy_code ---")
-    if not is_ready():
-        return {**state, "error": not_ready_message()}
     try:
         pct = position_size_pct(state, 10.0)
+        if fixtures_enabled(bool(state.get("use_fixtures"))):
+            print("  [fixtures] Loading pregenerated multi-stock SMA slope strategy")
+            code, config = load_multi_fixture(pct)
+            print(f"  Fixture multi strategy OK ({len(code)} chars), config={config}")
+            return {
+                **state,
+                "generated_code": code,
+                "current_config": config,
+                "current_iteration_number": 1,
+                "all_iteration_results": [],
+                "best_config_so_far": {},
+                "error": None,
+            }
+
+        if not is_ready():
+            return {**state, "error": not_ready_message()}
+
         stake_frac = round(pct / 100.0, 4)
         sizing = position_sizing_instructions(pct)
         prompt = multi_strategy_code_prompt(
@@ -181,6 +221,9 @@ def _run_bt(state: ScreenGraphState) -> ScreenGraphState:
 def _optimize(state: ScreenGraphState) -> ScreenGraphState:
     iteration = state["current_iteration_number"]
     print(f"--- Node: optimize_multi_strategy  (was iteration {iteration}) ---")
+    if fixtures_enabled(bool(state.get("use_fixtures"))):
+        print("  [fixtures] Skipping optimize")
+        return {**state, "current_iteration_number": 3}
     if not is_ready():
         return {**state, "error": not_ready_message()}
     prev = state["all_iteration_results"][-1]
@@ -236,6 +279,9 @@ def _after_gen(state: ScreenGraphState) -> str:
 
 def _after_run(state: ScreenGraphState) -> str:
     if state.get("error"):
+        return END
+    if fixtures_enabled(bool(state.get("use_fixtures"))):
+        print("  [fixtures] Done after 1 multi backtest iteration")
         return END
     if state["current_iteration_number"] >= 3:
         return END
