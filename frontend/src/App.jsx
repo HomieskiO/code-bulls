@@ -20,7 +20,7 @@ export default function App() {
   }])
   const [input,            setInput]            = useState("Trade AAPL. Buy when the 15-day EMA crosses above the 50-day EMA. Sell when it crosses below.")
   const [screeningInput,   setScreeningInput]   = useState("Top 1% of stocks with the biggest price move over the past 1 month")
-  const [strategyInput,    setStrategyInput]    = useState("Buy when the stock reaches a new all-time high (ATH). Sell when it closes below the 50-day SMA.")
+  const [strategyInput,    setStrategyInput]    = useState("Buy when the 10-day SMA is above the 20-day SMA and both SMAs are sloping up. Sell when the 10-day SMA is below the 20-day SMA and both SMAs are sloping down.")
   const [startDate,        setStartDate]        = useState(DEFAULT_START)
   const [endDate,          setEndDate]          = useState(DEFAULT_END)
   // Position sizing: % of available cash per trade (defaults differ by mode)
@@ -422,7 +422,7 @@ export default function App() {
                       value={strategyInput}
                       onChange={e => setStrategyInput(e.target.value)}
                       onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); run() } }}
-                      placeholder="e.g. buy on new ATH, sell when close < 50 SMA"
+                      placeholder="e.g. buy when SMA10 > SMA20 and both sloping up; sell when SMA10 < SMA20 and both sloping down"
                       disabled={loading}
                       rows={2}
                       style={{
@@ -438,7 +438,7 @@ export default function App() {
                 </div>
                 <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
                   {[
-                    { screen: 'Top 1% stocks by 1-month return', strategy: 'Buy when the stock reaches a new ATH. Sell when it closes below the 50-day SMA.' },
+                    { screen: 'Top 1% stocks by 1-month return', strategy: 'Buy when SMA10 > SMA20 and both sloping up. Sell when SMA10 < SMA20 and both sloping down.' },
                     { screen: 'Stocks with 3x average volume spike', strategy: 'Buy when screened. Sell when close drops below the 20-day EMA.' },
                     { screen: 'Stocks breaking above their 52-week high', strategy: 'Buy breakout when screened. Sell when price drops below EMA 20.' },
                   ].map(({ screen, strategy }) => (

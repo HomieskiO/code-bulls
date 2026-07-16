@@ -16,8 +16,22 @@ from codegen.extract import (
     position_size_pct,
     strategy_param_names,
 )
-from screening.engine import KAGGLE_STOCKS_PATH, MAX_UNIQUE_TICKERS
+from screening.engine import (
+    KAGGLE_STOCKS_PATH,
+    MAX_UNIQUE_TICKERS,
+    cap_screening_time_balanced,
+    screening_date_coverage,
+)
 from .cerebro_builder import build_cerebro, config_score, run_and_metrics
+
+# Dataset roots (SPY lives under ETFs/, equities under Stocks/)
+_KAGGLE_ETFS_PATH = os.path.normpath(
+    os.path.join(os.path.dirname(KAGGLE_STOCKS_PATH), "ETFs")
+)
+
+# Master clock for multi-stock Cerebro (data0). SPY first — full session calendar.
+# Not required to be in the screening list; strategy only buys when screened.
+CLOCK_CANDIDATES = ("SPY", "AAPL", "MSFT", "GE", "IBM")
 
 
 def get_ticker_from_prompt(prompt: str) -> str:
@@ -117,7 +131,31 @@ def _has_enough_data(filepath: str, min_bytes: int = 6_000) -> bool:
     return os.path.getsize(filepath) >= min_bytes
 
 
-def _price_series_sane(filepath: str, from_dt, to_dt) -> bool:
+def _resolve_csv_path(ticker: str) -> Optional[str]:
+    """Locate ticker CSV under Stocks/ then ETFs/ (SPY is an ETF in this dataset)."""
+    name = f"{ticker.lower()}.us.txt"
+    for root in (KAGGLE_STOCKS_PATH, _KAGGLE_ETFS_PATH):
+        path = os.path.join(root, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+# Strategies often use SMA(50) / Highest(252) — need enough bars in window
+_MIN_BARS_FOR_INDICATORS = int(os.getenv("MIN_BARS_FOR_INDICATORS", "280"))
+
+
+def _price_series_sane(
+    filepath: str,
+    from_dt,
+    to_dt,
+    *,
+    min_bars: int = _MIN_BARS_FOR_INDICATORS,
+) -> bool:
+    """
+    Reject corrupt prices and series too short for long indicators
+    (e.g. Highest period=252 → empty max() crash in runonce mode).
+    """
     try:
         closes = []
         with open(filepath, "r", errors="ignore") as fh:
@@ -139,19 +177,85 @@ def _price_series_sane(filepath: str, from_dt, to_dt) -> bool:
                     closes.append(float(parts[4]))
                 except Exception:
                     continue
-                if len(closes) >= 400:
-                    break
-        if len(closes) < 20:
+        if len(closes) < min_bars:
             return False
-        closes.sort()
-        med = closes[len(closes) // 2]
+        sample = closes[:: max(1, len(closes) // 400)][:400]
+        sample_sorted = sorted(sample)
+        med = sample_sorted[len(sample_sorted) // 2]
         if med <= 0 or med > 10_000 or med < 0.05:
             return False
-        if closes[-1] > 500_000:
+        if max(closes) > 500_000:
             return False
         return True
     except Exception:
         return False
+
+
+def _make_csv_feed(
+    ticker: str,
+    from_dt: dt_module.datetime,
+    to_dt: dt_module.datetime,
+    *,
+    name: Optional[str] = None,
+    allow_etf: bool = False,
+) -> Optional[bt.feeds.GenericCSVData]:
+    """Load one Kaggle CSV feed, or None if missing/unsuitable.
+
+    ``allow_etf=True`` also searches ETFs/ (needed for SPY clock).
+    Screened equities stay Stocks/-only via allow_etf=False.
+    """
+    if allow_etf:
+        filepath = _resolve_csv_path(ticker)
+    else:
+        filepath = os.path.join(KAGGLE_STOCKS_PATH, f"{ticker.lower()}.us.txt")
+        if not os.path.exists(filepath):
+            filepath = None
+    if not filepath or not _has_enough_data(filepath):
+        return None
+    if not _price_series_sane(filepath, from_dt, to_dt):
+        return None
+    feed_name = name or ticker
+    try:
+        return bt.feeds.GenericCSVData(
+            dataname=filepath,
+            name=feed_name,
+            dtformat=_fast_date_parse,
+            date=0,
+            open=1,
+            high=2,
+            low=3,
+            close=4,
+            volume=5,
+            openinterest=6,
+            fromdate=from_dt,
+            todate=to_dt,
+            preload=True,
+        )
+    except Exception as ex:
+        print(f"  WARNING: could not load {ticker}: {ex}")
+        return None
+
+
+def _peek_csv_date_range(ticker: str) -> str:
+    """First/last date strings from a stock/ETF file (for logging)."""
+    filepath = _resolve_csv_path(ticker)
+    if not filepath:
+        return "missing"
+    try:
+        with open(filepath, "r", errors="ignore") as fh:
+            fh.readline()
+            first = None
+            last = None
+            for line in fh:
+                if not line.strip():
+                    continue
+                d = line.split(",", 1)[0]
+                if first is None:
+                    first = d
+                last = d
+        return f"{first} → {last}"
+    except Exception:
+        return "unknown"
 
 
 def run_multi_backtest_core(
@@ -186,28 +290,24 @@ def run_multi_backtest_core(
             norm[dkey] = cleaned
     screening_dict = norm
 
+    print(f"  Pre-cap {screening_date_coverage(screening_dict)}")
+
+    # Time-balanced universe cap (per-year top names) — avoids 2017-only bias
+    n_unique = len({t for ts in screening_dict.values() for t in ts})
+    if n_unique > max_unique_tickers:
+        screening_dict, keep, cap_log = cap_screening_time_balanced(
+            screening_dict, max_unique_tickers=max_unique_tickers
+        )
+        print(f"  {cap_log}")
+    else:
+        keep = {t for ts in screening_dict.values() for t in ts}
+        print(f"  Universe under cap ({n_unique} unique) — no ticker trim")
+
+    print(f"  Post-cap {screening_date_coverage(screening_dict)}")
+
     all_tickers = sorted({t for ts in screening_dict.values() for t in ts})
     if not all_tickers:
         raise ValueError("Screening dict is empty — no tickers to trade.")
-
-    # Cap unique tickers
-    if len(all_tickers) > max_unique_tickers:
-        freq: Dict[str, int] = {}
-        for ts in screening_dict.values():
-            for t in ts:
-                freq[t] = freq.get(t, 0) + 1
-        keep = {
-            t
-            for t, _ in sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[
-                :max_unique_tickers
-            ]
-        }
-        screening_dict = {
-            d: [t for t in ts if t in keep] for d, ts in screening_dict.items()
-        }
-        screening_dict = {d: ts for d, ts in screening_dict.items() if ts}
-        all_tickers = sorted(keep)
-        print(f"  Capped universe to {len(all_tickers)} tickers (MAX_UNIQUE_TICKERS)")
 
     print(
         f"  Multi universe: {len(all_tickers)} tickers, "
@@ -215,12 +315,34 @@ def run_multi_backtest_core(
         f"{sum(len(v) for v in screening_dict.values())} pairs"
     )
 
-    preferred = [t for t in ("SPY", "AAPL", "MSFT", "GE", "IBM") if t in all_tickers]
-    ordered = preferred + [t for t in all_tickers if t not in preferred]
-    feeds = []
+    feeds: List[Tuple[Any, str]] = []
     skipped_invalid = skipped_bad = 0
 
-    for ticker in ordered:
+    # --- Master clock (data0): SPY (ETF) preferred for full session calendar ---
+    # Backtrader advances strategy.next() on data0's dates. Without a long
+    # liquid clock, a short-lived "top mover" as data0 confines the run to 2017.
+    clock_ticker = None
+    for cand in CLOCK_CANDIDATES:
+        feed = _make_csv_feed(cand, from_dt, to_dt, allow_etf=True)
+        if feed is not None:
+            clock_ticker = cand
+            feeds.append((feed, cand))
+            print(
+                f"  Clock feed (data0): {cand} "
+                f"file_range={_peek_csv_date_range(cand)} "
+                f"fromdate={from_dt.date()} todate={to_dt.date()}"
+            )
+            break
+    if clock_ticker is None:
+        print(
+            "  WARNING: no preferred clock feed found (tried SPY first); "
+            "using first screened ticker as data0 (may truncate timeline)"
+        )
+
+    # Remaining screened names (skip clock if already added)
+    for ticker in all_tickers:
+        if ticker == clock_ticker:
+            continue
         filepath = os.path.join(KAGGLE_STOCKS_PATH, f"{ticker.lower()}.us.txt")
         if not os.path.exists(filepath) or not _has_enough_data(filepath):
             skipped_invalid += 1
@@ -228,31 +350,23 @@ def run_multi_backtest_core(
         if not _price_series_sane(filepath, from_dt, to_dt):
             skipped_bad += 1
             continue
-        try:
-            feed = bt.feeds.GenericCSVData(
-                dataname=filepath,
-                name=ticker,
-                dtformat=_fast_date_parse,
-                date=0,
-                open=1,
-                high=2,
-                low=3,
-                close=4,
-                volume=5,
-                openinterest=6,
-                fromdate=from_dt,
-                todate=to_dt,
-                preload=True,
-            )
-            feeds.append((feed, ticker))
-        except Exception as ex:
-            print(f"  WARNING: skipping {ticker}: {ex}")
+        feed = _make_csv_feed(ticker, from_dt, to_dt)
+        if feed is None:
+            skipped_invalid += 1
+            continue
+        feeds.append((feed, ticker))
 
     if not feeds:
         raise ValueError("No ticker data could be loaded from the Kaggle dataset.")
+    if clock_ticker is None and feeds:
+        print(
+            f"  Clock feed (data0) fallback: {feeds[0][1]} "
+            f"file_range={_peek_csv_date_range(feeds[0][1])}"
+        )
     print(
-        f"  Loaded {len(feeds)} tickers "
-        f"({skipped_invalid} insufficient, {skipped_bad} bad prices skipped)."
+        f"  Loaded {len(feeds)} feeds "
+        f"(clock={clock_ticker or feeds[0][1]}, "
+        f"{skipped_invalid} insufficient, {skipped_bad} bad prices skipped)."
     )
 
     StrategyClass = load_strategy_class(strategy_code)
@@ -262,9 +376,6 @@ def run_multi_backtest_core(
     names = strategy_param_names(StrategyClass)
     if names and "stake_pct" not in names:
         run_config.pop("stake_pct", None)
-    if names and "screening" not in names:
-        # still need screening — inject via params default if missing is rare
-        pass
 
     cerebro = build_cerebro(
         strategy_cls=StrategyClass,

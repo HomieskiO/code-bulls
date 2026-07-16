@@ -113,14 +113,15 @@ Context:
 Compatibility:
 - For momentum/top-gainer screens, BUY when d._name in today_screened (do not require RSI oversold for entry).
 - Use RSI/stops mainly for exits unless the user explicitly wants mean-reversion entries.
-- For ATH breakouts: use Highest indicator; for SMA exits use SMA(period=50).
+- Dual SMA with slope: SMA(10) vs SMA(20); sloping up means sma[0] > sma[-1]; sloping down means sma[0] < sma[-1].
 
 Output EXACTLY two closed fences:
 ```python
 class MultiScreenStrategy(bt.Strategy):
     params = (
-        ('sma_period', 50),
-        ('warmup_period', 50),
+        ('sma_fast', 10),
+        ('sma_slow', 20),
+        ('warmup_period', 30),
         ('stake_pct', {stake_frac}),
         ('stop_loss', None),
         ('take_profit', None),
@@ -131,8 +132,8 @@ class MultiScreenStrategy(bt.Strategy):
         for d in self.datas:
             try:
                 self.inds[d._name] = {{
-                    'sma': bt.indicators.SMA(d, period=self.p.sma_period),
-                    'ath': bt.indicators.Highest(d.close, period=252),
+                    'fast': bt.indicators.SMA(d, period=self.p.sma_fast),
+                    'slow': bt.indicators.SMA(d, period=self.p.sma_slow),
                 }}
             except Exception:
                 pass
@@ -145,13 +146,17 @@ class MultiScreenStrategy(bt.Strategy):
             if len(d) <= self.p.warmup_period:
                 continue
             pos = self.getposition(d)
-            ath = self.inds[d._name]['ath'][0]
-            sma = self.inds[d._name]['sma'][0]
+            fast = self.inds[d._name]['fast']
+            slow = self.inds[d._name]['slow']
+            fast_up = fast[0] > fast[-1]
+            slow_up = slow[0] > slow[-1]
+            fast_dn = fast[0] < fast[-1]
+            slow_dn = slow[0] < slow[-1]
             if pos.size == 0:
-                if d._name in today_screened and d.close[0] >= ath:
+                if d._name in today_screened and fast[0] > slow[0] and fast_up and slow_up:
                     self.buy(data=d)
             else:
-                if d.close[0] < sma:
+                if fast[0] < slow[0] and fast_dn and slow_dn:
                     self.close(data=d)
             pos = self.getposition(d)
             if pos.size > 0:
@@ -161,7 +166,7 @@ class MultiScreenStrategy(bt.Strategy):
                     self.close(data=d)
 ```
 ```json
-{{"sma_period": 50, "warmup_period": 50, "stake_pct": {stake_frac}, "stop_loss": null, "take_profit": null}}
+{{"sma_fast": 10, "sma_slow": 20, "warmup_period": 30, "stake_pct": {stake_frac}, "stop_loss": null, "take_profit": null}}
 ```
 
 Rules:

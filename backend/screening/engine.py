@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -50,6 +50,99 @@ def _load_one(
         return df
     except Exception:
         return None
+
+
+def cap_screening_time_balanced(
+    screening_dict: Dict[str, List[str]],
+    max_unique_tickers: int = MAX_UNIQUE_TICKERS,
+) -> Tuple[Dict[str, List[str]], Set[str], str]:
+    """
+    Cap the unique-ticker universe in a time-balanced way.
+
+    Instead of keeping only globally most-frequent names (which biases toward
+    late-sample churn), take the top names **per calendar year**, then union.
+    That preserves names that led the screen in 2010–2016, not only 2017.
+
+    Returns (filtered_dict, keep_set, log_line).
+    """
+    if not screening_dict:
+        return {}, set(), "empty screening_dict"
+
+    # Frequency within each year
+    by_year: Dict[str, Dict[str, int]] = {}
+    for date_str, tickers in screening_dict.items():
+        year = str(date_str)[:4]
+        bucket = by_year.setdefault(year, {})
+        for t in tickers or []:
+            sym = str(t).strip().upper()
+            if sym:
+                bucket[sym] = bucket.get(sym, 0) + 1
+
+    years = sorted(by_year.keys())
+    n_years = max(1, len(years))
+    # Share budget across years; allow overlap so union stays near max_unique
+    per_year = max(15, (max_unique_tickers + n_years - 1) // n_years)
+
+    keep: Set[str] = set()
+    year_picks: Dict[str, int] = {}
+    for y in years:
+        ranked = sorted(by_year[y].items(), key=lambda kv: (-kv[1], kv[0]))
+        picked = [t for t, _ in ranked[:per_year]]
+        year_picks[y] = len(picked)
+        keep.update(picked)
+
+    # If union still too large (rare), trim by total frequency but keep at least
+    # a few names from each year.
+    if len(keep) > max_unique_tickers:
+        global_freq: Dict[str, int] = {}
+        for tickers in screening_dict.values():
+            for t in tickers or []:
+                sym = str(t).strip().upper()
+                if sym in keep:
+                    global_freq[sym] = global_freq.get(sym, 0) + 1
+        # Guarantee min floor per year
+        floor = max(5, per_year // 3)
+        guaranteed: Set[str] = set()
+        for y in years:
+            ranked = sorted(by_year[y].items(), key=lambda kv: (-kv[1], kv[0]))
+            guaranteed.update(t for t, _ in ranked[:floor] if t in keep)
+        rest_budget = max(0, max_unique_tickers - len(guaranteed))
+        rest = [
+            t
+            for t, _ in sorted(global_freq.items(), key=lambda kv: (-kv[1], kv[0]))
+            if t not in guaranteed
+        ][:rest_budget]
+        keep = guaranteed | set(rest)
+
+    filtered = {
+        d: [t for t in ts if t in keep]
+        for d, ts in screening_dict.items()
+    }
+    filtered = {d: ts for d, ts in filtered.items() if ts}
+
+    # Coverage diagnostics
+    years_with_days = sorted({d[:4] for d in filtered})
+    pairs = sum(len(v) for v in filtered.values())
+    log = (
+        f"time-balanced cap: keep={len(keep)} unique "
+        f"(per_year_budget={per_year}, years={years_with_days}), "
+        f"dates_left={len(filtered)}, pairs={pairs}, year_picks={year_picks}"
+    )
+    return filtered, keep, log
+
+
+def screening_date_coverage(screening_dict: Dict[str, List[str]]) -> str:
+    if not screening_dict:
+        return "coverage: empty"
+    dates = sorted(screening_dict.keys())
+    by_year: Dict[str, int] = {}
+    for d, ts in screening_dict.items():
+        y = d[:4]
+        by_year[y] = by_year.get(y, 0) + len(ts)
+    return (
+        f"coverage: {dates[0]} → {dates[-1]} "
+        f"({len(dates)} dates); pairs_by_year={dict(sorted(by_year.items()))}"
+    )
 
 
 def run_fixed_screener(
@@ -121,7 +214,7 @@ def run_fixed_screener(
             lambda x: x.pct_change(periods=lookback)
         )
 
-    combined = combined.dropna(subset=["metric"])
+    combined = combined.dropna(subset=["metric"]).copy()
     # Highest metric → smallest rank_pct when ascending=False
     combined["rank_pct"] = combined.groupby("Date")["metric"].rank(
         pct=True, ascending=False if not rank_asc else True
@@ -146,23 +239,15 @@ def run_fixed_screener(
     for date_str, grp in selected.groupby("date"):
         screening_dict[str(date_str)] = sorted(set(grp["ticker"].tolist()))
 
-    # Cap unique tickers by frequency (keep most frequently screened names)
-    freq: Dict[str, int] = {}
-    for tickers in screening_dict.values():
-        for t in tickers:
-            freq[t] = freq.get(t, 0) + 1
-    if len(freq) > max_unique_tickers:
-        keep = {
-            t
-            for t, _ in sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[
-                :max_unique_tickers
-            ]
-        }
-        screening_dict = {
-            d: [t for t in ts if t in keep]
-            for d, ts in screening_dict.items()
-        }
-        screening_dict = {d: ts for d, ts in screening_dict.items() if ts}
+    pre_cap_coverage = screening_date_coverage(screening_dict)
+    summary_lines.append(f"# pre-cap {pre_cap_coverage}")
+
+    # Time-balanced unique-ticker cap (avoids late-sample-only universes)
+    screening_dict, keep, cap_log = cap_screening_time_balanced(
+        screening_dict, max_unique_tickers=max_unique_tickers
+    )
+    summary_lines.append(f"# {cap_log}")
+    summary_lines.append(f"# post-cap {screening_date_coverage(screening_dict)}")
 
     n_tickers = len({t for v in screening_dict.values() for t in v})
     n_pairs = sum(len(v) for v in screening_dict.values())

@@ -99,7 +99,10 @@ def run_and_metrics(
     multi: bool = False,
 ) -> dict:
     if multi:
-        results = cerebro.run(stdstats=False, tradehistory=True)
+        # runonce=True precomputes indicators in batch; with many multi-length
+        # feeds that yields ValueError: max() iterable argument is empty
+        # (e.g. Highest/SMA once() on empty slices). Bar-by-bar is safer.
+        results = cerebro.run(stdstats=False, tradehistory=True, runonce=False)
     else:
         results = cerebro.run()
     return get_metrics(

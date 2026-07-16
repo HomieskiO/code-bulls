@@ -16,7 +16,7 @@ if os.path.exists(_dotenv):
     load_dotenv(dotenv_path=_dotenv)
 
 PROVIDER_DEFAULTS = {
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-2.5-flash-lite",
     "openai": "gpt-4o",
     "anthropic": "claude-opus-4-7",
     "ollama": "llama3.2",
