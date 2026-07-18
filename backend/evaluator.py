@@ -401,9 +401,12 @@ def get_metrics(cerebro, results, period_start: str = None, period_end: str = No
         if clipped:
             portfolio_values = clipped
 
-    # CAGR + total return over the (possibly clipped) equity window
+    # CAGR + total return over the equity window we actually have data for
     cagr = 0.0
     total_return = round((final_value / initial_cash - 1) * 100, 4) if initial_cash else 0.0
+    # Report *effective* data window (not only the user request). If the clock
+    # feed starts after the requested start, period_start_out is the real start
+    # so the SPY benchmark is normalized to the same day as the portfolio.
     period_start_out = period_start
     period_end_out   = period_end
 
@@ -412,8 +415,8 @@ def get_metrics(cerebro, results, period_start: str = None, period_end: str = No
         pv_last  = portfolio_values[-1]["value"]
         d0 = portfolio_values[0]["date"]
         d1 = portfolio_values[-1]["date"]
-        period_start_out = period_start_out or d0
-        period_end_out   = period_end_out   or d1
+        period_start_out = d0
+        period_end_out = d1
         days = (
             datetime.strptime(d1, "%Y-%m-%d") -
             datetime.strptime(d0, "%Y-%m-%d")

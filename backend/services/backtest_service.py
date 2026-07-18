@@ -180,8 +180,11 @@ def run_single(
         explanation=explanation,
     )
     pv = m.get("portfolio_values") or []
-    bm_start = m.get("period_start") or (pv[0]["date"] if pv else start_date)
-    bm_end = m.get("period_end") or (pv[-1]["date"] if pv else end_date)
+    # Align benchmark to the equity curve's first bar (not the raw request).
+    # If multi-data only had history from 2005, normalizing SPY from 1998 made
+    # the benchmark start near ~$330k while the portfolio still opened at $100k.
+    bm_start = (pv[0]["date"] if pv else None) or m.get("period_start") or start_date
+    bm_end = (pv[-1]["date"] if pv else None) or m.get("period_end") or end_date
     return {
         "strategy_id": rec.id,
         "best_configuration": best,
@@ -191,6 +194,7 @@ def run_single(
         "benchmark_ticker": benchmark_ticker,
         "benchmark_values": fetch_benchmark(benchmark_ticker, bm_start, bm_end),
         "period": {"start": start_date, "end": end_date},
+        "data_period": {"start": bm_start, "end": bm_end},
         "position_size_pct": position_size_pct,
         "used_fixtures": use_fx,
     }
@@ -250,8 +254,9 @@ def run_screened(
     screening_dict = final_state.get("screening_dict") or {}
     unique_tickers = sorted({t for v in screening_dict.values() for t in v})
     pv = m.get("portfolio_values") or []
-    bm_start = m.get("period_start") or (pv[0]["date"] if pv else start_date)
-    bm_end = m.get("period_end") or (pv[-1]["date"] if pv else end_date)
+    # Same start as equity curve so both open at initial capital on the chart
+    bm_start = (pv[0]["date"] if pv else None) or m.get("period_start") or start_date
+    bm_end = (pv[-1]["date"] if pv else None) or m.get("period_end") or end_date
     return {
         "strategy_id": rec.id,
         "best_configuration": best,
@@ -262,6 +267,7 @@ def run_screened(
         "benchmark_ticker": benchmark_ticker,
         "benchmark_values": fetch_benchmark(benchmark_ticker, bm_start, bm_end),
         "period": {"start": start_date, "end": end_date},
+        "data_period": {"start": bm_start, "end": bm_end},
         "position_size_pct": position_size_pct,
         "used_fixtures": use_fx,
         "screening_summary": {

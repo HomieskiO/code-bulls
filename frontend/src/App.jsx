@@ -560,6 +560,20 @@ export default function App() {
                             Metrics are over this window. Each entry uses the stake % of available cash.
                           </p>
                         </div>
+                        {results.data_period?.start && results.period?.start &&
+                          results.data_period.start.slice(0, 7) !== results.period.start.slice(0, 7) && (
+                          <p style={{ fontSize: 12, color: C.warning || C.gold, marginTop: 12, lineHeight: 1.5 }}>
+                            Equity &amp; benchmark charts use available data{' '}
+                            <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>
+                              {results.data_period.start}
+                            </span>
+                            {' → '}
+                            <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>
+                              {results.data_period.end ?? results.period.end}
+                            </span>
+                            {' '}(dataset clock may start later than the requested period).
+                          </p>
+                        )}
                       </Card>
                     </section>
                   )}

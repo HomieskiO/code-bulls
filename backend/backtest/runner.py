@@ -29,7 +29,9 @@ _KAGGLE_ETFS_PATH = os.path.normpath(
     os.path.join(os.path.dirname(KAGGLE_STOCKS_PATH), "ETFs")
 )
 
-# Master clock for multi-stock Cerebro (data0). SPY first — full session calendar.
+# Master clock candidates for multi-stock Cerebro (data0).
+# SPY is preferred when it covers the requested start; this Kaggle dump's SPY
+# only begins 2005-02-25, so earlier periods fall back to long equities (AAPL…).
 # Not required to be in the screening list; strategy only buys when screened.
 CLOCK_CANDIDATES = ("SPY", "AAPL", "MSFT", "GE", "IBM")
 
@@ -373,6 +375,34 @@ def _peek_csv_date_range(ticker: str) -> str:
         return "unknown"
 
 
+def _select_clock_ticker(period_start: str) -> Optional[str]:
+    """
+    Choose data0 so the multi-data calendar covers the requested start date.
+
+    Prefer SPY when its file starts on/before period_start; otherwise the first
+    candidate that does. Without this, a late SPY series (e.g. 2005+) silently
+    truncates a 1998→… backtest to mid-2000s.
+    """
+    covering: List[str] = []
+    fallback: List[str] = []
+    for cand in CLOCK_CANDIDATES:
+        path = _resolve_csv_path(cand)
+        if not path or not _has_enough_data(path):
+            continue
+        first = _csv_first_date(path)
+        if not first:
+            continue
+        fallback.append(cand)
+        if first <= period_start:
+            covering.append(cand)
+    if covering:
+        # Prefer SPY among those that actually cover the window
+        if "SPY" in covering:
+            return "SPY"
+        return covering[0]
+    return fallback[0] if fallback else None
+
+
 def run_multi_backtest_core(
     *,
     strategy_code: str,
@@ -462,13 +492,18 @@ def run_multi_backtest_core(
     feeds: List[Tuple[Any, str]] = []
     skipped_invalid = skipped_bad = 0
 
-    # --- Master clock (data0): SPY preferred; its session calendar is the align target ---
-    # Backtrader multi-data starts next() only when every feed has a first bar.
-    # Aligning every equity onto the clock calendar (NaN OHLC + volume=0 pre-IPO)
-    # keeps the timeline at the clock start while still trading late listings later.
+    # --- Master clock (data0): cover period_start when possible (not always SPY) ---
+    # This Kaggle SPY series starts 2005-02-25. Using it as data0 for a 1998 start
+    # silently dropped 1998–2005. Fall back to AAPL/GE/… that cover the window.
+    # Equities are then calendar-aligned onto the clock (volume=0 pre-IPO pads).
     clock_ticker = None
     calendar: Optional[pd.DatetimeIndex] = None
-    for cand in CLOCK_CANDIDATES:
+    chosen = _select_clock_ticker(period_start)
+    candidates = []
+    if chosen:
+        candidates.append(chosen)
+    candidates.extend(c for c in CLOCK_CANDIDATES if c != chosen)
+    for cand in candidates:
         clock_path = _resolve_csv_path(cand)
         if not clock_path or not _has_enough_data(clock_path):
             continue
@@ -478,17 +513,27 @@ def run_multi_backtest_core(
         calendar = clock_df.index
         clock_ticker = cand
         feeds.append((_make_pandas_feed(clock_df, cand, from_dt, to_dt), cand))
+        file_range = _peek_csv_date_range(cand)
+        cal_start = str(calendar[0].date()) if len(calendar) else "?"
+        note = ""
+        if cand != "SPY":
+            note = " (SPY Kaggle history too short for requested start — using equity clock)"
         print(
             f"  Clock feed (data0): {cand} "
-            f"file_range={_peek_csv_date_range(cand)} "
-            f"bars={len(calendar)} "
-            f"fromdate={from_dt.date()} todate={to_dt.date()} "
-            f"(equities calendar-aligned; volume=0 before first print)"
+            f"file_range={file_range} "
+            f"bars={len(calendar)} calendar_start={cal_start} "
+            f"fromdate={from_dt.date()} todate={to_dt.date()}"
+            f"{note}"
         )
+        if cal_start > period_start:
+            print(
+                f"  WARNING: clock {cand} first bar {cal_start} is after "
+                f"requested start {period_start} — early years still truncated"
+            )
         break
     if clock_ticker is None or calendar is None:
         print(
-            "  WARNING: no preferred clock feed found (tried SPY first); "
+            "  WARNING: no preferred clock feed found; "
             "using first screened ticker as data0 (may truncate timeline)"
         )
 
