@@ -13,9 +13,11 @@ from codegen.extract import (
     ensure_stake_pct_in_config,
     extract_code_and_config,
     inject_stake_pct_param,
+    inject_standard_strategy_params,
     normalize_python_source,
     position_size_pct,
     position_sizing_instructions,
+    sanitize_bt_code,
     validate_python_syntax,
 )
 from fixtures import (
@@ -147,9 +149,13 @@ def _gen_strategy(state: ScreenGraphState) -> ScreenGraphState:
         def _parse(resp: str):
             code, config = extract_code_and_config(resp)
             code = normalize_python_source(code)
+            code = sanitize_bt_code(code)
             code = inject_stake_pct_param(code, pct)
+            code = inject_standard_strategy_params(code, multi=True)
             validate_python_syntax(code)
             config = ensure_stake_pct_in_config(config, pct)
+            config.setdefault("stop_loss", None)
+            config.setdefault("take_profit", None)
             config.pop("screening", None)
             return code, config
 

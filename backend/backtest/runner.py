@@ -53,11 +53,12 @@ def flatten_yfinance_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _strategy_kwargs(StrategyClass: Type[bt.Strategy], config: dict) -> dict:
+    """Pass only params declared on the strategy (backtrader rejects unknowns)."""
     kwargs = dict(config)
     names = strategy_param_names(StrategyClass)
-    if names and "stake_pct" not in names:
-        kwargs.pop("stake_pct", None)
-    return kwargs
+    if not names:
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in names}
 
 
 def run_single_backtest(
@@ -583,12 +584,16 @@ def run_multi_backtest_core(
     config = ensure_stake_pct_in_config(config, pct)
     run_config = {**config, "screening": screening_dict}
     names = strategy_param_names(StrategyClass)
-    if names and "stake_pct" not in names:
-        run_config.pop("stake_pct", None)
+    if names and "screening" not in names:
+        raise ValueError(
+            "Multi-stock strategy must declare params screening={{}} "
+            f"(got params: {sorted(names)})"
+        )
+    kwargs = _strategy_kwargs(StrategyClass, run_config)
 
     cerebro = build_cerebro(
         strategy_cls=StrategyClass,
-        strategy_kwargs=run_config,
+        strategy_kwargs=kwargs,
         feeds=feeds,
         stake_pct=pct,
         multi=True,

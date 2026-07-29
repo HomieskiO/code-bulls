@@ -30,10 +30,18 @@ def build_bt_api_docs() -> str:
                 if k not in skip
             }
             lines.append(
-                f"  bt.indicators.{name}({', '.join(f'{k}={v!r}' for k, v in params.items())})"
+                f"  bt.indicators.{name}(data, {', '.join(f'{k}={v!r}' for k, v in params.items())})"
             )
         except Exception:
-            lines.append(f"  bt.indicators.{name}")
+            lines.append(f"  bt.indicators.{name}(data, ...)")
+    lines.append("")
+    lines.append(
+        "## Multi-feed indicators: first arg is the feed, POSITIONAL only "
+        "(never data= keyword)"
+    )
+    lines.append("  bt.indicators.SMA(d, period=20)")
+    lines.append("  bt.indicators.BollingerBands(d, period=20, devfactor=2.0)")
+    lines.append("  # WRONG: bt.indicators.BollingerBands(data=d, ...)")
     lines.append("")
     lines.append("## Strategy API: self.buy() self.sell() self.close() self.getposition(data)")
     lines.append("  self.broker.getcash()  self.broker.getvalue()")
@@ -46,50 +54,17 @@ _BT_API_DOCS = build_bt_api_docs()
 def strategy_code_prompt(user_prompt: str, position_sizing: str, stake_frac: float) -> str:
     return f"""Convert this trading strategy into a complete backtrader.Strategy class.
 
-User strategy:
 {user_prompt}
 
 {position_sizing}
 
-MANDATORY output — nothing else, both fences closed:
-```python
-class MyStrategy(bt.Strategy):
-    params = (
-        ('fast', 15),
-        ('slow', 50),
-        ('stake_pct', {stake_frac}),
-        ('stop_loss', None),
-        ('take_profit', None),
-    )
-    def __init__(self):
-        self.fast_ema = bt.indicators.EMA(period=self.p.fast)
-        self.slow_ema = bt.indicators.EMA(period=self.p.slow)
-        self.crossover = bt.indicators.CrossOver(self.fast_ema, self.slow_ema)
-    def next(self):
-        if not self.position:
-            if self.crossover[0] > 0:
-                self.buy()
-        else:
-            if self.crossover[0] < 0:
-                self.close()
-        if self.position.size > 0:
-            if self.p.stop_loss is not None and self.data.close[0] <= self.position.price * (1 - self.p.stop_loss):
-                self.close()
-            elif self.p.take_profit is not None and self.data.close[0] >= self.position.price * (1 + self.p.take_profit):
-                self.close()
-```
-```json
-{{"fast": 15, "slow": 50, "stake_pct": {stake_frac}, "stop_loss": null, "take_profit": null}}
-```
-
 Rules:
-- Adapt the example to the user strategy (indicators, periods, conditions).
 - params = (('name', default), ...) — never assign self.params.x in __init__.
 - No imports. No notify_trade/notify_order. No comments.
 - Include stop_loss, take_profit, stake_pct={stake_frac}.
 - On entry call self.buy() with NO size=.
-- Common indicators: EMA/SMA/RSI/MACD/BollingerBands/ATR/CrossOver/Highest/Lowest.
-- Close BOTH fences.
+- Output EXACTLY one ```python block and one ```json block. Close both fences.
+- Adapt indicators/logic to the user strategy.
 
 API reference:
 {_BT_API_DOCS}
@@ -111,89 +86,12 @@ Context:
 - today = self.datetime.date(0).strftime('%Y-%m-%d')
 - Match with: d._name in today_screened
 
-Compatibility:
-- For momentum/top-gainer screens, BUY when d._name in today_screened (do not require RSI oversold for entry).
-- Use RSI/stops mainly for exits unless the user explicitly wants mean-reversion entries.
-- Dual SMA with slope: SMA(10) vs SMA(20); sloping up means sma[0] > sma[-1]; sloping down means sma[0] < sma[-1].
-
-Output EXACTLY two closed fences:
-```python
-class MultiScreenStrategy(bt.Strategy):
-    params = (
-        ('sma_fast', 10),
-        ('sma_slow', 20),
-        ('warmup_period', 30),
-        ('stake_pct', {stake_frac}),
-        ('stop_loss', None),
-        ('take_profit', None),
-        ('screening', {{}}),
-    )
-    def __init__(self):
-        self.inds = {{}}
-        for d in self.datas:
-            try:
-                self.inds[d._name] = {{
-                    'fast': bt.indicators.SMA(d, period=self.p.sma_fast),
-                    'slow': bt.indicators.SMA(d, period=self.p.sma_slow),
-                }}
-            except Exception:
-                pass
-    def next(self):
-        today = self.datetime.date(0).strftime('%Y-%m-%d')
-        today_screened = self.p.screening.get(today, [])
-        for d in self.datas:
-            if d._name not in self.inds:
-                continue
-            if len(d) <= self.p.warmup_period:
-                continue
-            pos = self.getposition(d)
-            # Calendar-aligned: volume=0 means no real bar
-            try:
-                if float(d.volume[0]) <= 0:
-                    if pos.size > 0:
-                        self.close(data=d)
-                    continue
-                # require warmup live bars so indicators ignore zero-pads
-                if any(float(d.volume[-i]) <= 0 for i in range(self.p.warmup_period)):
-                    continue
-                px = float(d.close[0])
-                if px != px or px <= 0:
-                    continue
-            except Exception:
-                continue
-            fast = self.inds[d._name]['fast']
-            slow = self.inds[d._name]['slow']
-            try:
-                f0, s0 = float(fast[0]), float(slow[0])
-                f1, s1 = float(fast[-1]), float(slow[-1])
-            except Exception:
-                continue
-            if f0 != f0 or s0 != s0:
-                continue
-            fast_up = f0 > f1
-            slow_up = s0 > s1
-            fast_dn = f0 < f1
-            slow_dn = s0 < s1
-            if pos.size == 0:
-                if d._name in today_screened and f0 > s0 and fast_up and slow_up:
-                    self.buy(data=d)
-            else:
-                if f0 < s0 and fast_dn and slow_dn:
-                    self.close(data=d)
-            pos = self.getposition(d)
-            if pos.size > 0:
-                if self.p.stop_loss is not None and px <= pos.price * (1 - self.p.stop_loss):
-                    self.close(data=d)
-                elif self.p.take_profit is not None and px >= pos.price * (1 + self.p.take_profit):
-                    self.close(data=d)
-```
-```json
-{{"sma_fast": 10, "sma_slow": 20, "warmup_period": 30, "stake_pct": {stake_frac}, "stop_loss": null, "take_profit": null}}
-```
-
 Rules:
-- params include screening={{}} and stake_pct={stake_frac}. JSON must NOT include screening.
+- params include screening={{}}, stake_pct={stake_frac}, stop_loss=None, take_profit=None.
+- JSON must NOT include screening; may include stop_loss/take_profit (null or float).
 - self.buy(data=d) with NO size=. No imports, no notify_*, no comments. Close both fences.
+- Indicators: bt.indicators.X(d, period=...) — feed is first POSITIONAL arg. Never data=.
+- BollingerBands uses devfactor= (not dev=). Access bands via .lines.bot / .lines.mid / .lines.top (or .bot/.mid/.top).
 - try/except per feed for indicators; guard with if d._name not in self.inds.
 - Skip inactive bars: volume<=0 (calendar padding). Close open positions when volume hits 0.
 - Adapt indicators/logic to the user strategy while keeping screening gate for entries when relevant.

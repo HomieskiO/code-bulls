@@ -68,6 +68,35 @@ def inject_stake_pct_param(code: str, pct: float) -> str:
     return f"# position size: {pct:g}% cash per trade (stake_pct={frac})\n" + code
 
 
+def _param_declared(code: str, name: str) -> bool:
+    return bool(re.search(rf"""['"]{re.escape(name)}['"]""", code))
+
+
+def inject_param_if_missing(code: str, name: str, default_src: str) -> str:
+    """Insert ``('name', default)`` into ``params = (`` when missing."""
+    if _param_declared(code, name):
+        return code
+    m = re.search(r"params\s*=\s*\(\s*\n?", code)
+    if not m:
+        return code
+    return code[: m.end()] + f"        ('{name}', {default_src}),\n" + code[m.end() :]
+
+
+def inject_standard_strategy_params(code: str, *, multi: bool = False) -> str:
+    """
+    Ensure runtime-injected keys exist on the strategy class.
+
+    ``extract_code_and_config`` always setdefaults stop_loss/take_profit on the
+    config dict; cerebro passes them as kwargs. Missing params → TypeError.
+    Multi also requires ``screening`` for the daily ticker gate.
+    """
+    code = inject_param_if_missing(code, "stop_loss", "None")
+    code = inject_param_if_missing(code, "take_profit", "None")
+    if multi:
+        code = inject_param_if_missing(code, "screening", "{}")
+    return code
+
+
 def strategy_param_names(cls) -> set:
     try:
         return set(cls.params._getkeys())
@@ -78,10 +107,80 @@ def strategy_param_names(cls) -> set:
             return set()
 
 
+def _call_is_bt_indicator(func: ast.AST) -> bool:
+    """True for bt.indicators.X / bt.ind.X attribute chains."""
+    parts: list[str] = []
+    cur: ast.AST = func
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        parts.append(cur.id)
+    parts.reverse()
+    return (
+        len(parts) >= 3
+        and parts[0] == "bt"
+        and parts[1] in ("indicators", "ind")
+    )
+
+
+def _indicator_name(func: ast.AST) -> str:
+    return func.attr if isinstance(func, ast.Attribute) else ""
+
+
+class _RewriteIndicatorCalls(ast.NodeTransformer):
+    """
+    Fix common LLM mistakes on backtrader indicators:
+    - data=d keyword → first positional (indicators accept data only positionally)
+    - BollingerBands(dev=...) → devfactor=...
+    """
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        self.generic_visit(node)
+        if not _call_is_bt_indicator(node.func):
+            return node
+
+        name = _indicator_name(node.func)
+        data_val = None
+        new_keywords: list[ast.keyword] = []
+        for kw in node.keywords:
+            if kw.arg == "data":
+                data_val = kw.value
+                continue
+            if name in ("BollingerBands", "Bollinger") and kw.arg in (
+                "dev",
+                "devfactor",
+                "nbdev",
+            ):
+                # Canonical param is devfactor
+                new_keywords.append(ast.keyword(arg="devfactor", value=kw.value))
+                continue
+            new_keywords.append(kw)
+
+        if data_val is not None:
+            node.args = [data_val, *node.args]
+        node.keywords = new_keywords
+        return node
+
+
+def rewrite_indicator_calls(code: str) -> str:
+    """Rewrite invalid indicator kwargs; return original code if parse/unparse fails."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+    tree = _RewriteIndicatorCalls().visit(tree)
+    ast.fix_missing_locations(tree)
+    try:
+        return ast.unparse(tree) + "\n"
+    except Exception:
+        return code
+
+
 def sanitize_bt_code(code: str) -> str:
     for wrong, right in _CODE_FIXES.items():
         code = code.replace(wrong, right)
-    return code
+    return rewrite_indicator_calls(code)
 
 
 def normalize_python_source(code: str) -> str:
