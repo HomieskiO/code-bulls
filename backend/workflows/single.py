@@ -1,7 +1,8 @@
-"""Single-ticker LangGraph workflow."""
+"""Single-ticker LangGraph workflow — staged generate / adapt / optimize."""
 from __future__ import annotations
 
 import json
+import re
 from typing import List, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -21,11 +22,17 @@ from codegen.extract import (
 )
 from fixtures import fixtures_enabled, load_single_fixture
 from llm import call_llm, is_ready, not_ready_message
-from prompts import optimize_prompt, repair_strategy_prompt, strategy_code_prompt
+from prompts import (
+    adapt_strategy_prompt,
+    optimize_prompt,
+    repair_strategy_prompt,
+    strategy_code_prompt,
+)
 
 
-class GraphState(TypedDict):
+class GraphState(TypedDict, total=False):
     strategy_prompt: str
+    adapt_instruction: str
     start_date: str
     end_date: str
     position_size_pct: float
@@ -36,6 +43,20 @@ class GraphState(TypedDict):
     all_iteration_results: List[dict]
     best_config_so_far: dict
     error: str
+    generate_only: bool
+
+
+def _parse_single_strategy(resp: str, pct: float):
+    code, config = extract_code_and_config(resp)
+    code = normalize_python_source(code)
+    code = sanitize_bt_code(code)
+    code = inject_stake_pct_param(code, pct)
+    code = inject_standard_strategy_params(code, multi=False)
+    validate_python_syntax(code)
+    config = ensure_stake_pct_in_config(config, pct)
+    config.setdefault("stop_loss", None)
+    config.setdefault("take_profit", None)
+    return code, config
 
 
 def _generate(state: GraphState) -> GraphState:
@@ -63,21 +84,9 @@ def _generate(state: GraphState) -> GraphState:
         sizing = position_sizing_instructions(pct)
         prompt = strategy_code_prompt(state["strategy_prompt"], sizing, stake_frac)
 
-        def _parse(resp: str):
-            code, config = extract_code_and_config(resp)
-            code = normalize_python_source(code)
-            code = sanitize_bt_code(code)
-            code = inject_stake_pct_param(code, pct)
-            code = inject_standard_strategy_params(code, multi=False)
-            validate_python_syntax(code)
-            config = ensure_stake_pct_in_config(config, pct)
-            config.setdefault("stop_loss", None)
-            config.setdefault("take_profit", None)
-            return code, config
-
         text = call_llm(prompt)
         try:
-            code, config = _parse(text)
+            code, config = _parse_single_strategy(text, pct)
         except Exception as err:
             print(f"  First code-gen parse failed ({err}); repairing …")
             repair = repair_strategy_prompt(
@@ -88,7 +97,7 @@ def _generate(state: GraphState) -> GraphState:
                 stake_frac=stake_frac,
                 multi=False,
             )
-            code, config = _parse(call_llm(repair))
+            code, config = _parse_single_strategy(call_llm(repair), pct)
 
         print(f"  Generated strategy ({len(code)} chars), config={config}")
         return {
@@ -103,6 +112,75 @@ def _generate(state: GraphState) -> GraphState:
     except Exception as e:
         print(f"ERROR in generate_strategy_code: {e}")
         return {**state, "error": f"Failed to generate/parse LLM response: {e}"}
+
+
+def _adapt_strategy(state: GraphState) -> GraphState:
+    print("--- Node: adapt_strategy_code ---")
+    try:
+        pct = position_size_pct(state, 100.0)
+        instruction = (state.get("adapt_instruction") or "").strip()
+        if not instruction:
+            return {**state, "error": "Adapt instruction is empty."}
+        if not (state.get("generated_code") or "").strip():
+            return {**state, "error": "No generated code to adapt."}
+
+        if fixtures_enabled(bool(state.get("use_fixtures"))):
+            code, config = load_single_fixture(pct)
+            return {
+                **state,
+                "generated_code": code,
+                "current_config": config,
+                "current_iteration_number": 1,
+                "all_iteration_results": [],
+                "best_config_so_far": {},
+                "error": None,
+            }
+
+        if not is_ready():
+            return {**state, "error": not_ready_message()}
+
+        stake_frac = round(pct / 100.0, 4)
+        sizing = position_sizing_instructions(pct)
+        prompt = adapt_strategy_prompt(
+            user_prompt=state.get("strategy_prompt") or "",
+            adapt_instruction=instruction,
+            prev_code=state["generated_code"],
+            prev_config=state.get("current_config") or {},
+            position_sizing=sizing,
+            stake_frac=stake_frac,
+            multi=False,
+        )
+        text = call_llm(prompt)
+        try:
+            code, config = _parse_single_strategy(text, pct)
+        except Exception as err:
+            print(f"  Adapt parse failed ({err}); repairing …")
+            repair = repair_strategy_prompt(
+                error=str(err)[:400],
+                prev=text[:1500],
+                user_prompt=f"{state.get('strategy_prompt')}\nAdapt: {instruction}",
+                position_sizing=sizing,
+                stake_frac=stake_frac,
+                multi=False,
+            )
+            code, config = _parse_single_strategy(call_llm(repair), pct)
+
+        prior = state.get("strategy_prompt") or ""
+        merged_prompt = f"{prior}\n[Adapt] {instruction}".strip()
+        print(f"  Adapted strategy ({len(code)} chars), config={config}")
+        return {
+            **state,
+            "strategy_prompt": merged_prompt,
+            "generated_code": code,
+            "current_config": config,
+            "current_iteration_number": 1,
+            "all_iteration_results": [],
+            "best_config_so_far": {},
+            "error": None,
+        }
+    except Exception as e:
+        print(f"ERROR in adapt_strategy_code: {e}")
+        return {**state, "error": f"Failed to adapt strategy code: {e}"}
 
 
 def _run(state: GraphState) -> GraphState:
@@ -142,12 +220,11 @@ def _optimize(state: GraphState) -> GraphState:
     print(f"--- Node: optimize_strategy  (was iteration {iteration}) ---")
     if fixtures_enabled(bool(state.get("use_fixtures"))):
         print("  [fixtures] Skipping optimize (single iteration only)")
-        return {**state, "current_iteration_number": 3}  # force END after next check
+        return {**state, "current_iteration_number": 3}
     if not is_ready():
         return {**state, "error": not_ready_message()}
     prev = state["all_iteration_results"][-1]
     valid_keys = list(prev["config"].keys())
-    # Strip bulky series from metrics sent to LLM
     slim_metrics = {
         k: v
         for k, v in prev["metrics"].items()
@@ -163,8 +240,6 @@ def _optimize(state: GraphState) -> GraphState:
     )
     try:
         text = call_llm(prompt)
-        import re
-
         m = re.search(r"```json\n(.*?)```", text, re.DOTALL)
         if not m:
             raise ValueError("Optimisation response missing ```json block.")
@@ -188,7 +263,11 @@ def _optimize(state: GraphState) -> GraphState:
 
 
 def _after_gen(state: GraphState) -> str:
-    return END if state.get("error") else "run_backtest"
+    if state.get("error"):
+        return END
+    if state.get("generate_only"):
+        return END
+    return "run_backtest"
 
 
 def _after_run(state: GraphState) -> str:
@@ -215,3 +294,44 @@ workflow.add_conditional_edges(
 )
 workflow.add_edge("optimize_strategy", "run_backtest")
 app = workflow.compile()
+
+
+def run_single_generate(inputs: dict) -> dict:
+    return app.invoke({**inputs, "generate_only": True})
+
+
+def run_single_adapt(state: dict, adapt_instruction: str) -> dict:
+    return _adapt_strategy({**state, "adapt_instruction": adapt_instruction})
+
+
+def run_single_optimize(state: dict) -> dict:
+    if state.get("error"):
+        return state
+    if not state.get("generated_code"):
+        return {**state, "error": "No generated code to optimize."}
+
+    st: GraphState = {
+        **state,
+        "current_iteration_number": 1,
+        "all_iteration_results": [],
+        "best_config_so_far": {},
+        "error": None,
+        "generate_only": False,
+    }
+    st = _run(st)
+    if st.get("error"):
+        return st
+    while True:
+        nxt = _after_run(st)
+        if nxt == END or nxt is None:
+            break
+        if nxt == "optimize_strategy":
+            st = _optimize(st)
+            if st.get("error"):
+                return st
+            st = _run(st)
+            if st.get("error"):
+                return st
+        else:
+            break
+    return st

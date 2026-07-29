@@ -9,7 +9,14 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from database import SessionLocal, Strategy
-from services.backtest_service import run_screened, run_single
+from services.backtest_service import (
+    adapt_draft,
+    generate_screened,
+    generate_single,
+    optimize_draft,
+    run_screened,
+    run_single,
+)
 
 app = FastAPI()
 
@@ -66,7 +73,6 @@ class BacktestRequest(BaseModel):
     end_date: str = DEFAULT_END
     benchmark_ticker: str = "SPY"
     position_size_pct: float = 100.0
-    # Skip LLM: use pregenerated strategy for offline/full-pipeline testing
     use_fixtures: bool = False
 
 
@@ -79,6 +85,64 @@ class ScreenedBacktestRequest(BaseModel):
     position_size_pct: float = 10.0
     use_fixtures: bool = False
 
+
+class DraftAdaptRequest(BaseModel):
+    draft_id: str
+    adapt_instruction: str
+
+
+class DraftOptimizeRequest(BaseModel):
+    draft_id: str
+    benchmark_ticker: str = "SPY"
+
+
+# ── Staged pipeline ──────────────────────────────────────────────────────────
+
+@app.post("/api/backtest/generate")
+def generate_backtest(request: BacktestRequest):
+    start_date, end_date = _normalize_period(request.start_date, request.end_date)
+    position_size_pct = _normalize_position_size_pct(request.position_size_pct, 100.0)
+    return generate_single(
+        prompt=request.prompt,
+        start_date=start_date,
+        end_date=end_date,
+        position_size_pct=position_size_pct,
+        use_fixtures=request.use_fixtures,
+    )
+
+
+@app.post("/api/screen-backtest/generate")
+def generate_screened_backtest(request: ScreenedBacktestRequest):
+    start_date, end_date = _normalize_period(request.start_date, request.end_date)
+    position_size_pct = _normalize_position_size_pct(request.position_size_pct, 10.0)
+    return generate_screened(
+        strategy_prompt=request.strategy_prompt,
+        screening_prompt=request.screening_prompt,
+        start_date=start_date,
+        end_date=end_date,
+        position_size_pct=position_size_pct,
+        use_fixtures=request.use_fixtures,
+    )
+
+
+@app.post("/api/draft/adapt")
+def draft_adapt(request: DraftAdaptRequest):
+    return adapt_draft(
+        draft_id=request.draft_id,
+        adapt_instruction=request.adapt_instruction,
+    )
+
+
+@app.post("/api/draft/optimize")
+def draft_optimize(request: DraftOptimizeRequest, db: Session = Depends(get_db)):
+    return optimize_draft(
+        db,
+        draft_id=request.draft_id,
+        benchmark_ticker=request.benchmark_ticker or "SPY",
+    )
+
+
+# ── Legacy full pipeline (generate + optimize) ───────────────────────────────
 
 @app.post("/api/backtest")
 def run_backtest_endpoint(request: BacktestRequest, db: Session = Depends(get_db)):

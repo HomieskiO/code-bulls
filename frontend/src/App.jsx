@@ -4,7 +4,13 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine,
 } from 'recharts'
 import { C, DATASET_MAX_END, DEFAULT_START, DEFAULT_END, pct, dollar, num, sign } from './constants/theme'
-import { postBacktest, postScreenBacktest, fetchHistory as apiFetchHistory } from './api/backtest'
+import {
+  postGenerateBacktest,
+  postGenerateScreenBacktest,
+  postDraftAdapt,
+  postDraftOptimize,
+  fetchHistory as apiFetchHistory,
+} from './api/backtest'
 import {
   Label, Card, Tab, MetricCard, ChartTip, Msg, RunButton, ChartBox, Stat, downloadJSON,
 } from './components/ui'
@@ -16,7 +22,11 @@ export default function App() {
   const [mode,             setMode]             = useState('single')   // 'single' | 'screened'
   const [messages,         setMessages]         = useState([{
     type: 'ai',
-    content: "Welcome to AlgoTrader AI.\n\nDescribe your trading strategy, pick a start & end date, and I'll backtest and optimize it for you.",
+    content:
+      "Welcome to AlgoTrader AI.\n\n" +
+      "1) Describe your strategy → generate code\n" +
+      "2) Review the code, then either optimize config parameters or adapt the logic with a follow-up prompt\n" +
+      "3) Optimize runs the backtest + parameter search",
   }])
   const [input,            setInput]            = useState("Trade AAPL. Buy when the 15-day EMA crosses above the 50-day EMA. Sell when it crosses below.")
   const [screeningInput,   setScreeningInput]   = useState("Top 1% of stocks with the biggest price move over the past 1 month")
@@ -28,6 +38,9 @@ export default function App() {
   const [positionSizeMulti,  setPositionSizeMulti]  = useState(10)
   const [loading,          setLoading]          = useState(false)
   const [results,          setResults]          = useState(null)
+  // After code gen: { draft_id, generated_code, current_config, mode, ... }
+  const [pendingDraft,     setPendingDraft]     = useState(null)
+  const [adaptInput,       setAdaptInput]       = useState('')
   const [activeTab,        setActiveTab]        = useState('dashboard')
   const [startAmount,      setStartAmount]      = useState(100000)
   const [history,          setHistory]          = useState(null)
@@ -61,7 +74,26 @@ export default function App() {
     }
   }
 
-  const run = async () => {
+  const applyGeneratedDraft = (data, draftMode) => {
+    const draft = {
+      draft_id: data.draft_id,
+      generated_code: data.generated_code || '',
+      current_config: data.current_config || {},
+      screening_code: data.screening_code || '',
+      screening_summary: data.screening_summary || null,
+      period: data.period,
+      position_size_pct: data.position_size_pct,
+      mode: draftMode,
+    }
+    setPendingDraft(draft)
+    setResults(null)
+    setDebugData(null)
+    setActiveTab('code')
+    setAdaptInput('')
+    return draft
+  }
+
+  const runGenerate = async () => {
     const isScreened = mode === 'screened'
     const canRun = isScreened
       ? (screeningInput.trim() && strategyInput.trim())
@@ -96,6 +128,7 @@ export default function App() {
     const stakePct    = Math.min(100, Math.max(1, Number(positionSizePct) || (isScreened ? 10 : 100)))
 
     setLoading(true)
+    setPendingDraft(null)
 
     if (isScreened) {
       const userMsg =
@@ -105,45 +138,40 @@ export default function App() {
       setMessages(prev => [
         ...prev,
         { type: 'user', content: userMsg },
-        { type: 'ai',   content: 'Generating screener code, running screening, then backtesting…', thinking: true },
+        { type: 'ai', content: 'Running screening + generating strategy code…', thinking: true },
       ])
       try {
-        const { res, data } = await postScreenBacktest({
-            strategy_prompt:    strategyInput.trim(),
-            screening_prompt:   screeningInput.trim(),
-            start_date:         periodStart,
-            end_date:           periodEnd,
-            benchmark_ticker:   benchmarkTicker,
-            position_size_pct:  stakePct,
-            use_fixtures:       useFixtures,
-          })
+        const { res, data } = await postGenerateScreenBacktest({
+          strategy_prompt: strategyInput.trim(),
+          screening_prompt: screeningInput.trim(),
+          start_date: periodStart,
+          end_date: periodEnd,
+          position_size_pct: stakePct,
+          use_fixtures: useFixtures,
+        })
         if (!res.ok || data.error) {
           if (data.generated_code || data.screening_code) {
-            setDebugData({ error: data.error || `HTTP ${res.status}`, generated_code: data.generated_code || '', screening_code: data.screening_code || '' })
+            setDebugData({
+              error: data.error || `HTTP ${res.status}`,
+              generated_code: data.generated_code || '',
+              screening_code: data.screening_code || '',
+            })
             setActiveTab('code')
           }
           throw new Error(data.error || `HTTP ${res.status}`)
         }
-
-        setDebugData(null)
-        setResults({ ...data, _mode: 'screened' })
-        setActiveTab('dashboard')
-        setHistory(null)
-
-        const m = data.best_configuration?.metrics ?? {}
-        const n = data.all_iterations?.length ?? 0
+        applyGeneratedDraft(data, 'screened')
         const s = data.screening_summary ?? {}
-        const period = data.period ?? { start: periodStart, end: periodEnd }
         setMessages(prev => [
           ...prev.slice(0, -1),
           {
             type: 'ai',
             content:
-              `Screened backtest complete after ${n} iteration${n !== 1 ? 's' : ''}.\n\n` +
-              `Period: ${period.start} → ${period.end}\n` +
-              `Tickers traded: ${s.unique_tickers?.length ?? 0} unique symbols\n` +
-              `CAGR: ${pct(m.cagr)} | Drawdown: ${pct(m.max_drawdown)} | Win Rate: ${pct(m.win_rate)}\n\n` +
-              `Full results, charts & explanation are on the right →`,
+              `Strategy code generated.\n\n` +
+              `Screened universe: ${s.unique_tickers?.length ?? 0} unique tickers\n` +
+              `Review the code on the Strategy Code tab, then choose:\n` +
+              `• Optimize config — backtest + tune parameters\n` +
+              `• Adapt code — describe changes and regenerate logic`,
           },
         ])
       } catch (err) {
@@ -165,41 +193,37 @@ export default function App() {
             `${prompt}\n[Period] ${periodStart} → ${periodEnd}\n` +
             `[Position size] ${stakePct}% of available cash per trade`,
         },
-        { type: 'ai',   content: 'Running backtest & optimizing…', thinking: true },
+        { type: 'ai', content: 'Generating strategy code…', thinking: true },
       ])
       try {
-        const { res, data } = await postBacktest({
-            prompt,
-            start_date: periodStart,
-            end_date: periodEnd,
-            benchmark_ticker: benchmarkTicker,
-            position_size_pct: stakePct,
-            use_fixtures: useFixtures,
-          })
+        const { res, data } = await postGenerateBacktest({
+          prompt,
+          start_date: periodStart,
+          end_date: periodEnd,
+          position_size_pct: stakePct,
+          use_fixtures: useFixtures,
+        })
         if (!res.ok || data.error) {
           if (data.generated_code) {
-            setDebugData({ error: data.error || `HTTP ${res.status}`, generated_code: data.generated_code, screening_code: '' })
+            setDebugData({
+              error: data.error || `HTTP ${res.status}`,
+              generated_code: data.generated_code,
+              screening_code: '',
+            })
             setActiveTab('code')
           }
           throw new Error(data.error || `HTTP ${res.status}`)
         }
-
-        setDebugData(null)
-        setResults({ ...data, _mode: 'single' })
-        setActiveTab('dashboard')
-        setHistory(null)
-
-        const m = data.best_configuration?.metrics ?? {}
-        const n = data.all_iterations?.length ?? 0
-        const period = data.period ?? { start: periodStart, end: periodEnd }
+        applyGeneratedDraft(data, 'single')
         setMessages(prev => [
           ...prev.slice(0, -1),
           {
             type: 'ai',
-            content: `Optimization complete after ${n} iteration${n !== 1 ? 's' : ''}.\n\n` +
-              `Period: ${period.start} → ${period.end}\n` +
-              `CAGR: ${pct(m.cagr)} | Drawdown: ${pct(m.max_drawdown)} | Win Rate: ${pct(m.win_rate)}\n\n` +
-              `Full results, charts & explanation are on the right →`,
+            content:
+              `Strategy code generated.\n\n` +
+              `Review it on the Strategy Code tab, then choose:\n` +
+              `• Optimize config — backtest + tune parameters\n` +
+              `• Adapt code — describe changes and regenerate logic`,
           },
         ])
       } catch (err) {
@@ -213,12 +237,134 @@ export default function App() {
     }
   }
 
+  const runAdapt = async () => {
+    if (!pendingDraft?.draft_id || loading) return
+    const instruction = adaptInput.trim()
+    if (!instruction) {
+      setMessages(prev => [...prev, { type: 'ai', content: 'Describe how you want the strategy code adapted.' }])
+      return
+    }
+    setLoading(true)
+    setMessages(prev => [
+      ...prev,
+      { type: 'user', content: `[Adapt code] ${instruction}` },
+      { type: 'ai', content: 'Adapting strategy code…', thinking: true },
+    ])
+    try {
+      const { res, data } = await postDraftAdapt({
+        draft_id: pendingDraft.draft_id,
+        adapt_instruction: instruction,
+      })
+      if (!res.ok || data.error) {
+        if (data.generated_code) {
+          setDebugData({
+            error: data.error || `HTTP ${res.status}`,
+            generated_code: data.generated_code,
+            screening_code: data.screening_code || pendingDraft.screening_code || '',
+          })
+          setActiveTab('code')
+        }
+        throw new Error(data.error || `HTTP ${res.status}`)
+      }
+      applyGeneratedDraft(
+        { ...data, screening_code: data.screening_code || pendingDraft.screening_code },
+        pendingDraft.mode,
+      )
+      setMessages(prev => [
+        ...prev.slice(0, -1),
+        {
+          type: 'ai',
+          content:
+            `Code adapted.\n\n` +
+            `Review the updated strategy, then optimize config or adapt again.`,
+        },
+      ])
+    } catch (err) {
+      setMessages(prev => [
+        ...prev.slice(0, -1),
+        { type: 'ai', content: `Error: ${err.message}` },
+      ])
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const runOptimize = async () => {
+    if (!pendingDraft?.draft_id || loading) return
+    setLoading(true)
+    setMessages(prev => [
+      ...prev,
+      { type: 'user', content: '[Proceed] Optimize config parameters' },
+      { type: 'ai', content: 'Running backtest & optimizing parameters…', thinking: true },
+    ])
+    try {
+      const { res, data } = await postDraftOptimize({
+        draft_id: pendingDraft.draft_id,
+        benchmark_ticker: benchmarkTicker,
+      })
+      if (!res.ok || data.error) {
+        if (data.generated_code || data.screening_code) {
+          setDebugData({
+            error: data.error || `HTTP ${res.status}`,
+            generated_code: data.generated_code || pendingDraft.generated_code || '',
+            screening_code: data.screening_code || pendingDraft.screening_code || '',
+          })
+          setActiveTab('code')
+        }
+        throw new Error(data.error || `HTTP ${res.status}`)
+      }
+      setDebugData(null)
+      setPendingDraft(null)
+      setAdaptInput('')
+      setResults({ ...data, _mode: pendingDraft.mode })
+      setActiveTab('dashboard')
+      setHistory(null)
+
+      const m = data.best_configuration?.metrics ?? {}
+      const n = data.all_iterations?.length ?? 0
+      const period = data.period ?? {}
+      const s = data.screening_summary ?? {}
+      const multiBits = pendingDraft.mode === 'screened'
+        ? `Tickers traded: ${s.unique_tickers?.length ?? 0} unique symbols\n`
+        : ''
+      setMessages(prev => [
+        ...prev.slice(0, -1),
+        {
+          type: 'ai',
+          content:
+            `Optimization complete after ${n} iteration${n !== 1 ? 's' : ''}.\n\n` +
+            `Period: ${period.start ?? '—'} → ${period.end ?? '—'}\n` +
+            multiBits +
+            `CAGR: ${pct(m.cagr)} | Drawdown: ${pct(m.max_drawdown)} | Win Rate: ${pct(m.win_rate)}\n\n` +
+            `Full results, charts & explanation are on the right →`,
+        },
+      ])
+    } catch (err) {
+      setMessages(prev => [
+        ...prev.slice(0, -1),
+        { type: 'ai', content: `Error: ${err.message}` },
+      ])
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const discardDraft = () => {
+    setPendingDraft(null)
+    setAdaptInput('')
+    setMessages(prev => [
+      ...prev,
+      { type: 'ai', content: 'Draft discarded. Describe a new strategy to generate code again.' },
+    ])
+  }
+
   // Derived data
   const bm        = results?.best_configuration?.metrics ?? {}
-  const bestConf  = results?.best_configuration?.config  ?? {}
+  const bestConf  = results?.best_configuration?.config  ?? pendingDraft?.current_config ?? {}
   const iters     = results?.all_iterations ?? []
-  const genCode   = results?.generated_code ?? ''
+  const genCode   = results?.generated_code ?? pendingDraft?.generated_code ?? ''
   const explain   = results?.explanation    ?? ''
+  const awaitDecision = Boolean(pendingDraft?.draft_id) && !loading
 
   const chartData = iters.map((it, i) => ({
     n:        it.iteration ?? i + 1,
@@ -296,11 +442,23 @@ export default function App() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <div style={{
             width: 8, height: 8, borderRadius: '50%',
-            background: results ? C.success : loading ? C.warning : C.muted,
-            boxShadow: results ? `0 0 8px ${C.success}88` : loading ? `0 0 8px ${C.warning}88` : 'none',
+            background: results ? C.success : pendingDraft ? C.accent : loading ? C.warning : C.muted,
+            boxShadow: results
+              ? `0 0 8px ${C.success}88`
+              : pendingDraft
+                ? `0 0 8px ${C.accent}88`
+                : loading
+                  ? `0 0 8px ${C.warning}88`
+                  : 'none',
           }} />
           <span style={{ fontSize: 12, color: C.muted }}>
-            {loading ? 'Running…' : results ? 'Results ready' : 'Idle'}
+            {loading
+              ? 'Running…'
+              : pendingDraft
+                ? 'Code ready — choose next step'
+                : results
+                  ? 'Results ready'
+                  : 'Idle'}
           </span>
         </div>
       </header>
@@ -341,7 +499,13 @@ export default function App() {
               ].map(m => (
                 <button
                   key={m.id}
-                  onClick={() => setMode(m.id)}
+                  onClick={() => {
+                    if (m.id !== mode) {
+                      setMode(m.id)
+                      setPendingDraft(null)
+                      setAdaptInput('')
+                    }
+                  }}
                   style={{
                     flex: 1, padding: '5px 0', border: 'none', borderRadius: 8,
                     fontFamily: 'inherit', fontSize: 11, fontWeight: 600, cursor: 'pointer',
@@ -397,14 +561,85 @@ export default function App() {
               <span style={{ fontSize: 10, color: C.muted }}>· no LLM</span>
             </label>
 
-            {mode === 'single' ? (
+            {/* After code gen: optimize vs adapt */}
+            {awaitDecision ? (
+              <div style={{
+                display: 'flex', flexDirection: 'column', gap: 8,
+                padding: 10, borderRadius: 12,
+                background: C.accent + '12', border: `1px solid ${C.accent}44`,
+              }}>
+                <p style={{ fontSize: 11, fontWeight: 700, color: C.accent, textTransform: 'uppercase', letterSpacing: '.05em' }}>
+                  Next step
+                </p>
+                <p style={{ fontSize: 12, color: C.muted, lineHeight: 1.45 }}>
+                  Code is ready. Optimize parameters, or describe code changes to regenerate.
+                </p>
+                <button
+                  type="button"
+                  disabled={loading}
+                  onClick={runOptimize}
+                  style={{
+                    width: '100%', padding: '10px 12px', border: 'none', borderRadius: 10,
+                    background: `linear-gradient(135deg,${C.accent},${C.purple})`,
+                    color: '#fff', fontWeight: 700, fontSize: 13, cursor: loading ? 'default' : 'pointer',
+                  }}
+                >
+                  Optimize config
+                </button>
+                <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, overflow: 'hidden' }}>
+                  <textarea
+                    value={adaptInput}
+                    onChange={e => setAdaptInput(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault()
+                        runAdapt()
+                      }
+                    }}
+                    placeholder="Adapt code… e.g. use RSI exits, add 5% stop-loss, tighten entry"
+                    disabled={loading}
+                    rows={2}
+                    style={{
+                      width: '100%', padding: '8px 11px',
+                      background: 'transparent', border: 'none',
+                      color: C.text, fontSize: 12.5, resize: 'none', lineHeight: 1.45,
+                    }}
+                  />
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6, padding: '6px 8px', borderTop: `1px solid ${C.border}` }}>
+                    <button
+                      type="button"
+                      disabled={loading || !adaptInput.trim()}
+                      onClick={runAdapt}
+                      style={{
+                        padding: '6px 12px', borderRadius: 8, border: `1px solid ${C.border}`,
+                        background: C.surface, color: adaptInput.trim() ? C.text : C.muted,
+                        fontSize: 12, fontWeight: 600, cursor: loading || !adaptInput.trim() ? 'default' : 'pointer',
+                      }}
+                    >
+                      Adapt code
+                    </button>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={loading}
+                  onClick={discardDraft}
+                  style={{
+                    background: 'transparent', border: 'none', color: C.muted,
+                    fontSize: 11, cursor: 'pointer', textAlign: 'center', padding: 4,
+                  }}
+                >
+                  Discard draft & start over
+                </button>
+              </div>
+            ) : mode === 'single' ? (
               /* ── Single-stock input ── */
               <>
                 <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden' }}>
                   <textarea
                     value={input}
                     onChange={e => setInput(e.target.value)}
-                    onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); run() } }}
+                    onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runGenerate() } }}
                     placeholder="Describe your trading strategy…"
                     disabled={loading}
                     rows={3}
@@ -415,8 +650,8 @@ export default function App() {
                     }}
                   />
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 11px', borderTop: `1px solid ${C.border}` }}>
-                    <span style={{ fontSize: 11, color: C.muted }}>↵ send · ⇧↵ newline</span>
-                    <RunButton loading={loading} disabled={!input.trim() || !datesValid || !positionSizeValid} onClick={run} />
+                    <span style={{ fontSize: 11, color: C.muted }}>Generate code · ↵</span>
+                    <RunButton loading={loading} disabled={!input.trim() || !datesValid || !positionSizeValid} onClick={runGenerate} />
                   </div>
                 </div>
                 <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -463,7 +698,7 @@ export default function App() {
                     <textarea
                       value={strategyInput}
                       onChange={e => setStrategyInput(e.target.value)}
-                      onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); run() } }}
+                      onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runGenerate() } }}
                       placeholder="e.g. buy when SMA10 > SMA20 and both sloping up; sell when SMA10 < SMA20 and both sloping down"
                       disabled={loading}
                       rows={2}
@@ -475,7 +710,7 @@ export default function App() {
                     />
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                    <RunButton loading={loading} disabled={!screeningInput.trim() || !strategyInput.trim() || !datesValid || !positionSizeValid} onClick={run} />
+                    <RunButton loading={loading} disabled={!screeningInput.trim() || !strategyInput.trim() || !datesValid || !positionSizeValid} onClick={runGenerate} />
                   </div>
                 </div>
                 <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -962,11 +1197,14 @@ export default function App() {
 
             {/* ── CODE TAB ──────────────────────────────────────────── */}
             {activeTab === 'code' && (() => {
-              const codeSource  = results ?? debugData
+              const codeSource  = results ?? pendingDraft ?? debugData
               const dispCode    = codeSource?.generated_code ?? genCode
-              const screenCode  = codeSource?.screening_code ?? results?.screening_code ?? ''
+              const screenCode  = codeSource?.screening_code
+                ?? results?.screening_code
+                ?? pendingDraft?.screening_code
+                ?? ''
               const errorMsg    = debugData?.error ?? null
-              const runId       = results?.strategy_id ?? 'run'
+              const runId       = results?.strategy_id ?? pendingDraft?.draft_id ?? 'run'
 
               const downloadPy = (code, name) => {
                 const blob = new Blob([code], { type: 'text/x-python' })

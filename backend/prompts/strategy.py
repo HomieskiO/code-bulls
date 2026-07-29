@@ -130,6 +130,54 @@ Include stake_pct={stake_frac}. No prose. Close both fences. Use buy() without s
 """
 
 
+def adapt_strategy_prompt(
+    *,
+    user_prompt: str,
+    adapt_instruction: str,
+    prev_code: str,
+    prev_config: dict,
+    position_sizing: str,
+    stake_frac: float,
+    multi: bool = False,
+) -> str:
+    kind = "multi-asset screening strategy" if multi else "backtrader strategy"
+    multi_bits = ""
+    if multi:
+        multi_bits = """
+Multi-asset rules (keep):
+- params include screening={{}} and stake_pct.
+- Indicators take feed as first POSITIONAL arg: bt.indicators.X(d, ...). Never data=.
+- Only OPEN new positions when d._name in today_screened; skip volume<=0 bars.
+"""
+    return f"""You are adapting an existing {kind}.
+
+Original strategy idea:
+{user_prompt}
+
+User adaptation request (apply this change):
+{adapt_instruction}
+
+Current strategy code:
+```python
+{prev_code}
+```
+
+Previous default config:
+```json
+{json.dumps(prev_config, indent=2)}
+```
+
+{position_sizing}
+{multi_bits}
+Rewrite the FULL strategy with the adaptation applied.
+Output EXACTLY one ```python block and one ```json block.
+Include stake_pct={stake_frac}, stop_loss, take_profit.
+No imports, no notify_*, no comments, no prose. Close both fences.
+Use buy() without size=.
+{"Include screening={{}} in params; omit screening from JSON." if multi else ""}
+"""
+
+
 def optimize_prompt(
     *,
     user_prompt: str,
