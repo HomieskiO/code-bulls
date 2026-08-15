@@ -34,6 +34,7 @@ DEFAULT_SCREENING_PARAMS = {
     "top_pct": 0.01,
     "metric": "pct_change",
     "rank_ascending": False,
+    "min_metric": None,
 }
 
 

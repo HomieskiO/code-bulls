@@ -20,11 +20,7 @@ from codegen.extract import (
     sanitize_bt_code,
     validate_python_syntax,
 )
-from fixtures import (
-    fixtures_enabled,
-    load_multi_fixture,
-    load_screening_params_fixture,
-)
+from fixtures import fixtures_enabled, load_multi_fixture
 from llm import call_llm, is_ready, not_ready_message
 from prompts import (
     adapt_strategy_prompt,
@@ -32,12 +28,14 @@ from prompts import (
     optimize_prompt,
     repair_strategy_prompt,
 )
-from screening.engine import MAX_UNIQUE_TICKERS, run_fixed_screener
-from screening.params import (
-    SCREENING_PARAMS_PROMPT,
-    infer_screening_params,
-    parse_screening_params_from_llm,
+from screening.codegen import (
+    SCREENING_CODE_PROMPT,
+    SCREENING_REPAIR_PROMPT,
+    extract_screening_code,
+    fixture_screening_code,
 )
+from screening.engine import MAX_UNIQUE_TICKERS, run_generated_screener
+
 
 
 class ScreenGraphState(TypedDict, total=False):
@@ -50,8 +48,9 @@ class ScreenGraphState(TypedDict, total=False):
     use_fixtures: bool
     generated_code: str
     screening_code: str
-    screening_params: dict
+    screening_params: dict  # legacy / unused for LLM path; kept for draft compat
     screening_dict: dict
+    screening_csv_path: str
     current_iteration_number: int
     current_config: dict
     all_iteration_results: List[dict]
@@ -78,74 +77,104 @@ def _parse_multi_strategy(resp: str, pct: float):
 
 
 def _gen_screening(state: ScreenGraphState) -> ScreenGraphState:
-    print("--- Node: generate_screening_params ---")
+    """LLM (or fixture) generates Python that writes the screened-stocks CSV."""
+    print("--- Node: generate_screening_code ---")
     try:
+        user_rule = (state.get("screening_prompt") or "").strip()
+        if not user_rule:
+            return {**state, "error": "Screening prompt is empty."}
+
+        start = state.get("start_date") or "2010-01-01"
+        end = state.get("end_date") or "2017-11-10"
+
         if fixtures_enabled(bool(state.get("use_fixtures"))):
-            params = load_screening_params_fixture()
-            heur = infer_screening_params(state.get("screening_prompt") or "")
-            params = {
-                **params,
-                **{
-                    k: heur[k]
-                    for k in ("lookback_days", "top_pct", "metric")
-                    if k in heur
-                },
-            }
-            print(f"  [fixtures] Screening params: {params}")
+            code = fixture_screening_code()
+            print(f"  [fixtures] Screening code ({len(code)} chars)")
             return {
                 **state,
-                "screening_params": params,
-                "screening_code": "",
+                "screening_code": code,
+                "screening_params": {},
                 "error": None,
             }
 
         if not is_ready():
             return {**state, "error": not_ready_message()}
 
-        prompt = SCREENING_PARAMS_PROMPT.format(prompt=state["screening_prompt"])
+        prompt = SCREENING_CODE_PROMPT.format(
+            prompt=user_rule, start_date=start, end_date=end
+        )
         text = call_llm(prompt)
-        params = parse_screening_params_from_llm(text, state["screening_prompt"])
-        print(f"  Screening params: {params}")
+        try:
+            code = extract_screening_code(text)
+        except Exception as err:
+            print(f"  Screening code parse failed ({err}); repairing …")
+            repair = SCREENING_REPAIR_PROMPT.format(
+                error=str(err)[:400],
+                prev=(text or "")[:1500],
+                prompt=user_rule,
+                start_date=start,
+                end_date=end,
+            )
+            code = extract_screening_code(call_llm(repair))
+
+        print(f"  Screening code OK ({len(code)} chars)")
         return {
             **state,
-            "screening_params": params,
-            "screening_code": "",
+            "screening_code": code,
+            "screening_params": {},
             "error": None,
         }
     except Exception as e:
-        print(f"ERROR generate_screening_params: {e}")
-        return {**state, "error": f"Failed to parse screening params: {e}"}
+        print(f"ERROR generate_screening_code: {e}")
+        return {**state, "error": f"Failed to generate screening code: {e}"}
 
 
 def _run_screening(state: ScreenGraphState) -> ScreenGraphState:
-    print("--- Node: run_fixed_screener ---")
+    """Execute generated screening Python → CSV → screening_dict (same API as before)."""
+    print("--- Node: run_generated_screener ---")
     try:
-        params = state.get("screening_params") or {}
-        screening_dict, summary = run_fixed_screener(
-            params,
-            start_date=state.get("start_date") or "",
-            end_date=state.get("end_date") or "",
+        code = (state.get("screening_code") or "").strip()
+        if not code:
+            return {**state, "error": "No screening code to run."}
+
+        start = state.get("start_date") or "2010-01-01"
+        end = state.get("end_date") or "2017-11-10"
+        screening_dict, screening_code, csv_path = run_generated_screener(
+            code,
+            start_date=start,
+            end_date=end,
             max_unique_tickers=MAX_UNIQUE_TICKERS,
         )
         if not screening_dict:
             return {
                 **state,
+                "screening_code": screening_code,
+                "screening_csv_path": csv_path,
                 "error": "Screening returned no results — no tickers passed the criteria.",
             }
         n_pairs = sum(len(v) for v in screening_dict.values())
         print(
             f"  Screening complete: {len(screening_dict)} dates, "
-            f"{n_pairs} ticker-day pairs."
+            f"{n_pairs} ticker-day pairs. csv={csv_path}"
         )
         return {
             **state,
             "screening_dict": screening_dict,
-            "screening_code": summary,
+            "screening_code": screening_code,
+            "screening_csv_path": csv_path,
             "error": None,
         }
+
     except Exception as e:
-        print(f"ERROR run_fixed_screener: {e}")
-        return {**state, "error": f"Screening failed: {e}"}
+        import traceback
+
+        traceback.print_exc()
+        print(f"ERROR run_generated_screener: {e}")
+        return {
+            **state,
+            "screening_code": state.get("screening_code") or "",
+            "error": f"Screening failed: {e}",
+        }
 
 
 def _gen_strategy(state: ScreenGraphState) -> ScreenGraphState:
